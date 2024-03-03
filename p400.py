@@ -87,15 +87,6 @@ def nmf_objective(trial, mat, MSE_trial, k_1se_trial, study_name,
     to_r(L1_w, "L1_w"); to_r(L1_h, "L1_h")
     to_r(L2_w, "L2_w"); to_r(L2_h, "L2_h")
     
-    # import random
-    # L1=True; L2=False
-    # L1_w = random.uniform(0.001, 0.999) if L1 else 0
-    # L1_h = random.uniform(0.001, 0.999) if L1 else 0
-    # L2_w = random.uniform(0.001, 0.999) if L2 else 0
-    # L2_h = random.uniform(0.001, 0.999) if L2 else 0
-    # to_r(L1_w, "L1_w"); to_r(L1_h, "L1_h")
-    # to_r(L2_w, "L2_w"); to_r(L2_h, "L2_h")
-    
     #r('seed = sample(1:1000, 1, replace=FALSE)')
     r('MSE = RcppML::crossValidate(mat, k = seq(1, k_max, 1), '
         'L1 = c(L1_w, L1_h), L2 = c(L2_w, L2_h), '
@@ -126,8 +117,11 @@ def plot_MSE(axes, idx, study_name, cell_type, MSE_trial,
         if current_study == study_name and current_cell_type == cell_type:
             mean_MSE = MSE.groupby('k').mean()
             k_1se = k_1se_trial[study_name, cell_type, L1_w, L1_h, L2_w, L2_h]
-            ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=0.08)
-            ax.scatter(k_1se, mean_MSE[k_1se], color='black', s=16, alpha=0.08)
+            
+            ax.plot(mean_MSE.index, mean_MSE.values, color='black', 
+                    alpha=0.08)
+            ax.scatter(k_1se, mean_MSE[k_1se], color='black', s=16, 
+                       alpha=0.08)
     mean_MSE = MSE_final.groupby('k').mean()
     k_final = k_1se_trial[study_name, cell_type, *best_params.values()]
     ax.plot(mean_MSE.index, mean_MSE.values, color='red')
@@ -186,7 +180,7 @@ for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
         options(RcppML.verbose = TRUE)
         res = nmf(mat, k = k_select, 
                 L1=c(bp$L1_w, bp$L1_h), L2=c(bp$L2_w, bp$L2_h), 
-                seed=1:100, tol=1e-5, maxit=.Machine$integer.max)
+                seed=1:10, tol=1e-5, maxit=.Machine$integer.max)
         H = res@h
         W = res@w
     ''')
@@ -229,8 +223,13 @@ mat = X.T[gene_mask]
 mat = normalize_matrix(mat, 'rint')
 
 import nimfa
+
+mat_m = 
+
 snmf = nimfa.Snmf(mat, seed='random_vcol', version='l', 
                   max_iter=10, track_factor=True, track_error=True)
+
+snmf.select_features()
 
 ranks = range(1, 20, 1)
 summary = snmf.estimate_rank(rank_range=ranks, n_run=10, what='all')
