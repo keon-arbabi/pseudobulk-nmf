@@ -135,7 +135,7 @@ def cross_validate(mat, kmax, beta, reps, n, verbose=False):
 def objective(trial, MSE_trial, k_1se_trial, cell_type, 
               mat, kmax, reps=3, n=0.05, verbose=False):
     from scipy.stats import sem 
-    beta = trial.suggest_loguniform('beta', 1e-6, 1e-1)
+    beta = trial.suggest_float('beta', 1e-6, 1e-1, log=True)
     
     MSE = cross_validate(mat, kmax, beta, reps, n, verbose)
     mean_MSE = MSE.groupby('k').mean()
@@ -164,6 +164,11 @@ save_name = '_rint_l'
 MSE_trial, k_1se_trial = {}, {}
 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
+# os.makedirs(f'results/NMF/MSE/p400', exist_ok=True)
+# os.makedirs(f'results/NMF/factors/p400', exist_ok=True)
+# os.makedirs(f'figures/NMF/stats/p400', exist_ok=True)
+# os.makedirs(f'figures/NMF/MSE/p400', exist_ok=True)
+
 for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
     
     gene_mask = var['_index'].is_in(de.filter(
@@ -171,13 +176,14 @@ for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
     mat = X.T[gene_mask] 
     mat = normalize_matrix(mat, 'rint')
     
-    study = optuna.create_study(
-        sampler=optuna.samplers.TPESampler(multivariate=True),
-        direction='minimize')
-    study.optimize(lambda trial: objective(
-        trial, MSE_trial, k_1se_trial, cell_type, 
-        mat, kmax, reps=3, n=0.05, verbose=True), 
-        n_trials=n_trials)
+    with Timer (f'[{cell_type}]: Optuna'):
+        study = optuna.create_study(
+            sampler=optuna.samplers.TPESampler(multivariate=True),
+            direction='minimize')
+        study.optimize(lambda trial: objective(
+            trial, MSE_trial, k_1se_trial, cell_type, 
+            mat, kmax, reps=3, n=0.05, verbose=True), 
+            n_trials=n_trials)
 
     best_beta = study.best_trial.params.get('beta', 0)
     MSE_final = MSE_trial[cell_type, best_beta]
@@ -192,23 +198,20 @@ for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
         .rename(lambda col: col.replace('column_', 'S'))
     H = pl.DataFrame(snmf_fit.coef()).explode(pl.all())
     H.columns = obs['ID']
-
-    os.makedirs(f'results/NMF/MSE/p400', exist_ok=True)
-    os.makedirs(f'results/NMF/factors/p400', exist_ok=True)
-    MSE_final.to_csv(f'results/NMF/MSE/p400/{cell_type}_MSE{save_name}.tsv', 
-                    sep='\t')
-    W.write_csv(f'results/NMF/factors/p400/{cell_type}_W{save_name}.tsv',
-             separator='\t')
-    H.write_csv(f'results/NMF/factors/p400/{cell_type}_H{save_name}.tsv', 
-             separator='\t')
+    MSE_final.to_csv(
+        f'results/NMF/MSE/p400/{cell_type}_MSE{save_name}.tsv', sep='\t')
+    W.write_csv(
+        f'results/NMF/factors/p400/{cell_type}_W{save_name}.tsv', 
+        separator='\t')
+    H.write_csv(
+        f'results/NMF/factors/p400/{cell_type}_H{save_name}.tsv', 
+        separator='\t')
     
-    os.makedirs(f'figures/NMF/stats/p400', exist_ok=True)
     plot_k_stats(snmf, kmax, cell_type,
                  plot_directory='figures/NMF/stats/p400')
     plot_k_MSE(axes, idx, cell_type, 
                MSE_trial, k_1se_trial, MSE_final, best_beta)
     
-os.makedirs(f'figures/NMF/MSE/p400', exist_ok=True)
 fig.subplots_adjust(left=0.1, right=0.9, bottom=0.1,
                     top=0.9, wspace=0.4, hspace=0.4)
 savefig(f"figures/NMF/MSE/p400/MSE{save_name}.png", dpi=300)
