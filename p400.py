@@ -1,13 +1,9 @@
-import sys, os, pickle, optuna
-import polars as pl, pandas as pd, numpy as np
-import matplotlib.pylab as plt
-import seaborn as sns
+import os
+import polars as pl, numpy as np
 
 os.chdir('projects/def-wainberg/karbabi/single-cell-nmf')
-from utils import Timer, print_df, get_coding_genes, debug, savefig, \
+from utils import Timer, print_df, get_coding_genes, debug, \
     SingleCell, Pseudobulk
-from ryp import r, to_py, to_r    
-from project_utils import plot_volcano, normalize_matrix
 
 debug(third_party=True)
 
@@ -30,7 +26,7 @@ with Timer('QC single-cell data and pseudobulk'):
         .pseudobulk(ID_column='projid', 
                     cell_type_column='subset',
                     additional_obs=rosmap_pheno)
-    pb.save('data/pseudobulk/p400')
+    #pb.save('data/pseudobulk/p400')
 
 with Timer('QC pseudobulk data'):
     pb = Pseudobulk('data/pseudobulk/p400')
@@ -45,7 +41,7 @@ with Timer('QC pseudobulk data'):
             min_nonzero_percent=80,
             min_num_cells=10,
             custom_filter=pl.col.pmAD.is_not_null())
-    pb.save('data/pseudobulk/p400_qcd')
+    #pb.save('data/pseudobulk/p400_qcd')
         
 with Timer('Differential expression'):
     pb = Pseudobulk('data/pseudobulk/p400_qcd')
@@ -53,23 +49,14 @@ with Timer('Differential expression'):
         .DE(DE_label_column='pmAD', 
             covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
             include_library_size_as_covariate=True,
-            voom_plot_directory=None)
-    #de.write_csv('results/differential-expression/p400_broad.csv')     
+            voom_plot_directory='figures/DE/voom/p400')
+    #de.write_csv('results/DE/p400_broad.csv')     
 
 print(Pseudobulk.get_num_DE_hits(de, threshold=0.1).sort('cell_type'))
 print_df(Pseudobulk.get_DE_hits(de, threshold=1, num_top_hits=20)\
          .filter(cell_type='Inhibitory'))
 
 '''
-cell_type         num_hits 
- Astrocytes        608      
- CUX2+             1097     
- Endothelial       2        
- Inhibitory        690      
- Microglia         28       
- OPCs              7        
- Oligodendrocytes  361       
- 
 cell_type         num_hits 
  Astrocytes        568      
  CUX2+             1305     
@@ -82,6 +69,195 @@ shape: (7, 2)
  
 '''
 ################################################################################
+
+import os, nimfa, optuna
+import polars as pl, pandas as pd, numpy as np
+import matplotlib.pylab as plt, seaborn as sns
+
+os.chdir('projects/def-wainberg/karbabi/single-cell-nmf')
+from utils import Timer, print_df, debug, savefig, Pseudobulk
+from ryp import r, to_py, to_r    
+from project_utils import plot_volcano, plot_k_MSE, plot_k_stats
+
+debug(third_party=True)
+
+def normalize_matrix(mat, norm_method):
+    
+    from scipy.stats import rankdata
+    from utils import inverse_normal_transform
+    
+    if not np.isfinite(mat).all():
+        raise ValueError('Matrix contains NaN, infinity, or missing values')
+    if np.any(np.ptp(mat, axis=1) == 0):
+        raise ValueError("Matrix contains rows with constant values")
+    if norm_method == 'median' or norm_method == 'mean':
+        shift = abs(np.min(mat))
+        mat += shift
+        if norm_method == 'median':
+            norm_factor = np.median(mat, axis=1)[:, None]
+        else:  
+            norm_factor = np.mean(mat, axis=1)[:, None]
+        mat /= norm_factor
+    elif norm_method == 'minmax':
+        mat -= np.min(mat, axis=1)[:, None]
+        mat /= np.max(mat, axis=1)[:, None]
+    elif norm_method == 'quantile':
+        mat = np.apply_along_axis(rankdata, 1, mat) - 1
+        mat /= (mat.shape[1] - 1)  
+    elif norm_method == 'rint':
+        mat = np.apply_along_axis(inverse_normal_transform, 1, mat)
+        mat += abs(np.min(mat))
+    else:
+        raise ValueError(f"Unknown method: {norm_method}") 
+    return mat
+
+def cross_validate(mat, kmax, beta, reps, n, verbose=False):
+    import nimfa    
+    res = []
+    for rep in range(1, reps + 1):
+        mask = np.random.rand(*mat.shape) < (1 - n) 
+        mat_masked = mat * mask 
+        for k in range(1, kmax + 1):
+            snmf = nimfa.Snmf(mat_masked, rank=k, version='l',
+                              beta=beta, max_iter=30, n_run=1)
+            mat_est = snmf().fitted()
+            mat_est = np.asarray(mat_est)
+            MSE = np.mean((mat[~mask] - mat_est[~mask]) ** 2)
+            if verbose:      
+                print(f'rep {rep}, rank: {k}, MSE: {MSE}')
+            res.append((rep, k, MSE))
+            
+    MSE = pd.DataFrame(res, columns=['rep', 'k', 'MSE'])\
+        .astype({'k': int, 'rep': int})\
+        .set_index(['k', 'rep']).squeeze()
+    return(MSE)    
+    
+def objective(trial, MSE_trial, k_1se_trial, cell_type, 
+              mat, kmax, reps=3, n=0.05, verbose=False):
+    from scipy.stats import sem 
+    beta = trial.suggest_loguniform('beta', 1e-6, 1e-1)
+    
+    MSE = cross_validate(mat, kmax, beta, reps, n, verbose)
+    mean_MSE = MSE.groupby('k').mean()
+    k_best = int(mean_MSE.idxmin())
+    k_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[k_best] + \
+        sem(MSE[k_best])][0])
+    
+    MSE_trial[cell_type, beta] = MSE
+    k_1se_trial[cell_type, beta] = k_1se
+    print(f'[{cell_type}]: {k_1se=}')
+    error = mean_MSE[k_1se]
+    return(error)
+
+################################################################################
+
+de = pl.read_csv('results/DE/p400_broad.csv')
+lcpm = Pseudobulk('data/pseudobulk/p400_qcd')\
+    .drop(Pseudobulk.get_num_DE_hits(de, threshold=0.1)\
+            .filter(pl.col.num_hits <= 100)['cell_type'])\
+    .filter_obs(pmAD=1)\
+    .log_CPM(prior_count=2)
+
+kmax = 30
+n_trials = 30
+save_name = '_rint_l'
+MSE_trial, k_1se_trial = {}, {}
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
+    
+    gene_mask = var['_index'].is_in(de.filter(
+        (pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene'])
+    mat = X.T[gene_mask] 
+    mat = normalize_matrix(mat, 'rint')
+    
+    study = optuna.create_study(
+        sampler=optuna.samplers.TPESampler(multivariate=True),
+        direction='minimize')
+    study.optimize(lambda trial: objective(
+        trial, MSE_trial, k_1se_trial, cell_type, 
+        mat, kmax, reps=3, n=0.05, verbose=True), 
+        n_trials=n_trials)
+
+    best_beta = study.best_trial.params.get('beta', 0)
+    MSE_final = MSE_trial[cell_type, best_beta]
+    k_final = k_1se_trial[cell_type, best_beta]
+    
+    snmf = nimfa.Snmf(mat, seed="random_vcol",
+                      rank=k_final, version='l', beta=best_beta,
+                      max_iter=50, n_run=20)
+    snmf_fit = snmf()
+    
+    W = pl.DataFrame(snmf_fit.basis()).explode(pl.all())\
+        .rename(lambda col: col.replace('column_', 'S'))
+    H = pl.DataFrame(snmf_fit.coef()).explode(pl.all())
+    H.columns = obs['ID']
+
+    os.makedirs(f'results/NMF/MSE/p400', exist_ok=True)
+    os.makedirs(f'results/NMF/factors/p400', exist_ok=True)
+    MSE_final.to_csv(f'results/NMF/MSE/p400/{cell_type}_MSE{save_name}.tsv', 
+                    sep='\t')
+    W.write_csv(f'results/NMF/factors/p400/{cell_type}_W{save_name}.tsv',
+             separator='\t')
+    H.write_csv(f'results/NMF/factors/p400/{cell_type}_H{save_name}.tsv', 
+             separator='\t')
+    
+    os.makedirs(f'figures/NMF/stats/p400', exist_ok=True)
+    plot_k_stats(snmf, kmax, cell_type,
+                 plot_directory='figures/NMF/stats/p400')
+    plot_k_MSE(axes, idx, cell_type, 
+               MSE_trial, k_1se_trial, MSE_final, best_beta)
+    
+os.makedirs(f'figures/NMF/MSE/p400', exist_ok=True)
+fig.subplots_adjust(left=0.1, right=0.9, bottom=0.1,
+                    top=0.9, wspace=0.4, hspace=0.4)
+savefig(f"figures/NMF/MSE/p400/MSE{save_name}.png", dpi=300)
+
+
+
+with Timer('Volcano plots'):
+    for cell_type in de['cell_type'].unique():
+        df = pl.read_csv('results/DE/p400_broad.csv')\
+            .filter(cell_type=cell_type)
+        plot_volcano(df, threshold=0.1, num_top_genes=30,
+                     min_distance=0.08,
+                     plot_directory='figures/DE/volcano/p400')     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def nmf_objective(trial, mat, MSE_trial, k_1se_trial, study_name,
                   cell_type, k_max, L1=True, L2=False):
@@ -320,92 +496,9 @@ for cell_type, (X, obs, var) in lcpm.items():
 
 
 
-de = pl.read_csv('results/differential-expression/p400_broad.csv')
-lcpm = Pseudobulk('data/pseudobulk/p400_qcd')\
-    .drop(Pseudobulk.get_num_DE_hits(de, threshold=0.1)\
-            .filter(pl.col.num_hits < 100)['cell_type'])\
-    .filter_obs(pmAD=1)\
-    .log_CPM(prior_count=2)
-    
-cell_type = 'Inhibitory'
-X = lcpm.X[cell_type]
-obs = lcpm.obs[cell_type]
-var = lcpm.var[cell_type]
-gene_mask = var['_index'].is_in(de.filter(
-        (pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene'])
-
-mat = X.T[gene_mask] 
-mat = normalize_matrix(mat, 'rint')
-
-def cross_validate(mat, kmax, reps=3, n=0.05, verbose=False):
-    import nimfa    
-    from scipy.stats import sem 
-    res = []
-    for rep in range(1, reps + 1):
-        mask = np.random.rand(*mat.shape) < (1 - n) 
-        mat_masked = mat * mask 
-        for k in range(1, kmax + 1):
-            snmf = nimfa.Snmf(mat_masked, rank=k, version='l', 
-                              max_iter=30, n_run=1)
-            snmf_fit = snmf()
-            mat_est = np.asarray(snmf_fit.fitted())
-            MSE = np.mean((mat[~mask] - mat_est[~mask]) ** 2)
-            if verbose:      
-                print(f'rep {rep}, rank: {k}, MSE: {MSE}')
-            res.append((rep, k, MSE))
-            
-    MSE = pd.DataFrame(res, columns=['k', 'rep', 'MSE'])\
-        .set_index(['k', 'rep'])['MSE']
-        
-    mean_MSE = MSE.groupby('k').mean()
-    k_best = int(mean_MSE.idxmin())
-    k_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[k_best] + \
-        sem(MSE[k_best])][0])
 
 
 
-
-ranks = range(1, 20, 1)
-summary = snmf.estimate_rank(rank_range=ranks, n_run=10, what='all')
-summary[1].keys()
-
-spar = [summary[rank]['sparseness'] for rank in ranks]
-rss = [summary[rank]['rss'] for rank in ranks]
-evar = [summary[rank]['evar'] for rank in ranks]    
-coph = [summary[rank]['cophenetic'] for rank in ranks]
-disp = [summary[rank]['dispersion'] for rank in ranks]
-spar_w, spar_h = zip(*spar)
-        
-fig, axs = plt.subplots(2, 3, figsize=(15, 10)) 
-
-axs[0, 0].plot(ranks, rss, 'o-', label='RSS', linewidth=2)
-axs[0, 0].set_title('RSS')
-axs[0, 1].plot(ranks, coph, 'o-', label='Cophenetic correlation', linewidth=2)
-axs[0, 1].set_title('Cophenetic correlation')
-axs[0, 2].plot(ranks, disp, 'o-', label='Dispersion', linewidth=2)
-axs[0, 2].set_title('Dispersion')
-axs[1, 0].plot(ranks, spar_w, 'o-', label='Sparsity (Basis)', linewidth=2)
-axs[1, 0].set_title('Sparsity (Basis)')
-axs[1, 1].plot(ranks, spar_h, 'o-', label='Sparsity (Mixture)', linewidth=2)
-axs[1, 1].set_title('Sparsity (Mixture)')
-axs[1, 2].plot(ranks, evar, 'o-', label='Explained variance', linewidth=2)
-axs[1, 2].set_title('Explained variance')
-
-from matplotlib.ticker import MaxNLocator
-for ax in axs.flat:
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-savefig("p3.png", dpi=300)
-
-snmf = nimfa.Snmf(V, seed="random_c", rank=8, max_iter=30, version='r')
-snmf_fit = snmf()
- 
-W = pl.DataFrame(snmf_fit.basis()).explode(pl.all())\
-    .rename(lambda col: col.replace('column_', 'S'))
-to_r(W, 'W', format='df', rownames=var['_index'].filter(gene_mask))
-
-H = pl.DataFrame(snmf_fit.coef()).explode(pl.all())
-H.columns = obs['ID']
-to_r(H, 'H', format='df', rownames=W.columns)
 
 
 
