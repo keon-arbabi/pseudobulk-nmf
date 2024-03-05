@@ -1,5 +1,164 @@
 
 
+
+
+
+def nmf_objective(trial, mat, MSE_trial, k_1se_trial, study_name,
+                  cell_type, k_max, L1=True, L2=False):
+    
+    from scipy.stats import sem
+    r('''library(RcppML, quietly = TRUE)
+    if (is.null(getOption("RcppML.verbose"))) options(RcppML.verbose = TRUE)
+    if (is.null(getOption("RcppML.threads"))) options(RcppML.threads = 0)''')
+
+    L1_w = trial.suggest_float('L1_w', 0.001, 0.999, log=False) if L1 else 0
+    L1_h = trial.suggest_float('L1_h', 0.001, 0.999, log=False) if L1 else 0
+    L2_w = trial.suggest_float('L2_w', 1e-5, 1e-1, log=True) if L2 else 0
+    L2_h = trial.suggest_float('L2_h', 1e-5, 1e-1, log=True) if L2 else 0
+    to_r(L1_w, "L1_w"); to_r(L1_h, "L1_h")
+    to_r(L2_w, "L2_w"); to_r(L2_h, "L2_h")
+    
+    r('''MSE = RcppML::crossValidate(
+        mat, k = seq(1, k_max, 1), 
+        L1 = c(L1_w, L1_h), L2 = c(L2_w, L2_h), 
+        seed = 0, reps = 3, tol = 1e-2, 
+        maxit = .Machine$integer.max)''')
+    
+    MSE = to_py('MSE', format='pandas').astype({'k': int, 'rep': int})\
+        .set_index(['k', 'rep']).squeeze().rename('MSE')
+    mean_MSE = MSE.groupby('k').mean()
+    k_best = int(mean_MSE.idxmin())
+    k_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[k_best] +\
+        sem(MSE[k_best])][0])
+    
+    MSE_trial[study_name, cell_type, L1_w, L1_h, L2_w, L2_h] = MSE
+    k_1se_trial[study_name, cell_type, L1_w, L1_h, L2_w, L2_h] = k_1se
+    print(f'[{study_name} {cell_type}]: {k_1se=}')
+    
+    error = mean_MSE[k_1se]
+    return error
+
+def plot_MSE(axes, idx, study_name, cell_type, MSE_trial, 
+             k_1se_trial, MSE_final, best_params):
+    row, col = divmod(idx, 2)
+    ax = axes[row, col]
+    for (current_study, current_cell_type, L1_w, L1_h, L2_w, L2_h), \
+        MSE in MSE_trial.items():
+        if current_study == study_name and current_cell_type == cell_type:
+            mean_MSE = MSE.groupby('k').mean()
+            k_1se = k_1se_trial[study_name, cell_type, L1_w, L1_h, L2_w, L2_h]
+            alpha = min(1, sum(best_params.values()) / 4) ** (1/2) 
+            ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=alpha)
+            ax.scatter(k_1se, mean_MSE[k_1se], color='black', s=16, alpha=alpha)
+    mean_MSE = MSE_final.groupby('k').mean()
+    k_final = k_1se_trial[study_name, cell_type, *best_params.values()]
+    ax.plot(mean_MSE.index, mean_MSE.values, color='red')
+    ax.scatter(k_final, mean_MSE[k_final], color='red', s=50)
+    #ax.set_xticks(ticks=mean_MSE.index)
+    ax.set_yscale('log')
+    ax.set_title(rf"$\bf{{{study_name}\;{cell_type}}}$"
+                + "\nMSE across Optuna trials\n"
+                + f"Selected L1_w: {best_params['L1_w']:.3f}, "
+                + f"L1_h: {best_params['L1_h']:.3f}, "
+                + f"L2_w: {best_params['L2_w']:.3f}, "
+                + f"L2_h: {best_params['L2_h']:.3f}")
+    ax.set_xlabel('k')
+    ax.set_ylabel('Mean MSE')
+
+de = pl.read_csv('results/differential-expression/p400_broad.csv')
+lcpm = Pseudobulk('data/pseudobulk/p400_qcd')\
+    .drop(Pseudobulk.get_num_DE_hits(de, threshold=0.1)\
+            .filter(pl.col.num_hits < 100)['cell_type'])\
+    .filter_obs(pmAD=1)\
+    .log_CPM(prior_count=2)
+
+
+norm = 'rint'
+L1 = True
+L2 = False
+n_trials = 30
+k_max = 50; to_r(k_max, 'k_max')
+study_name = 'p400'
+save_name = '_rint_L1'; to_r(save_name, 'save_name')
+
+MSE_trial, k_1se_trial = {}, {}
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
+    gene_mask = var['_index'].is_in(de.filter(
+            (pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene'])
+    mat = X.T[gene_mask] 
+    mat = normalize_matrix(mat, norm)
+    to_r(mat, 'mat', format='matrix')
+    
+    study = optuna.create_study(
+        sampler=optuna.samplers.TPESampler(multivariate=True),
+        #sampler=optuna.samplers.RandomSampler(),
+        direction='minimize')
+    study.optimize(lambda trial: nmf_objective(
+        trial, mat, MSE_trial, k_1se_trial,\
+        study_name, cell_type, k_max, L1=L1, L2=L2), 
+        n_trials=n_trials)
+
+    best_params = {param: study.best_trial.params.get(param, 0)
+                    for param in ['L1_w', 'L1_h', 'L2_w', 'L2_h']}
+    L1_w, L1_h, L2_w, L2_h = best_params.values()
+    MSE_final = MSE_trial[study_name, cell_type, *best_params.values()]
+    k_select = k_1se_trial[study_name, cell_type, *best_params.values()]
+    to_r(k_select, 'k_select')
+    to_r(best_params, 'bp')
+    r('''
+      res = nmf(mat, k = k_select, 
+                L1=c(bp$L1_w, bp$L1_h), L2=c(bp$L2_w, bp$L2_h), 
+                seed=1:50, tol=1e-5, maxit=.Machine$integer.max)
+        H = res@h; W = res@w
+    ''')
+    W = to_py('W', format='pandas')\
+        .set_axis(var.filter(gene_mask)['_index'].to_list())\
+        .rename(columns=lambda col: col.replace('nmf', 'S'))
+    H = to_py('H', format='pandas').T\
+        .set_axis(obs['ID'].to_list())\
+        .rename(columns=lambda col: col.replace('nmf', 'S'))
+
+    os.makedirs(f'results/MSE/{study_name}', exist_ok=True)
+    os.makedirs(f'results/NMF/{study_name}', exist_ok=True)
+    MSE_final.to_csv(
+        f'results/MSE/{study_name}/{cell_type}_MSE{save_name}.tsv', sep='\t')
+    W.to_csv(f'results/NMF/{study_name}/{cell_type}_W{save_name}.tsv', sep='\t')
+    H.to_csv(f'results/NMF/{study_name}/{cell_type}_H{save_name}.tsv', sep='\t')
+
+    plot_MSE(axes, idx, study_name, cell_type,
+             MSE_trial, k_1se_trial, MSE_final, best_params)
+fig.subplots_adjust(left=0.1, right=0.9, bottom=0.1,
+                    top=0.9, wspace=0.4, hspace=0.4)
+savefig(f"results/MSE/{study_name}/MSE_plots{save_name}.png", dpi=300)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from matplotlib.colors import ListedColormap
 
 data1 = mat[0:50, 0:50] 
@@ -28,88 +187,6 @@ savefig('tmp3.png')
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-de = pl.read_csv('results/differential-expression/p400_broad.csv')
-lcpm = Pseudobulk('data/pseudobulk/p400_qcd')\
-    .drop(Pseudobulk.get_num_DE_hits(de, threshold=0.1)\
-            .filter(pl.col.num_hits < 100)['cell_type'])\
-    .filter_obs(pmAD=1)\
-    .log_CPM(prior_count=2)
-
-cell_type = 'Inhibitory'
-X = lcpm.X[cell_type]
-obs = lcpm.obs[cell_type]
-var = lcpm.var[cell_type]
-
-gene_mask = var['_index'].is_in(de.filter(
-        (pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene'])
-mat = X.T[gene_mask] 
-mat = normalize_matrix(mat, 'rint')
-
-import nimfa
-
-
-snmf = nimfa.Snmf(mat, seed='random_vcol', version='l', 
-                  max_iter=10, track_factor=True, track_error=True)
-
-snmf.select_features()
-
-ranks = range(1, 20, 1)
-summary = snmf.estimate_rank(rank_range=ranks, n_run=10, what='all')
-summary[1].keys()
-
-spar = [summary[rank]['sparseness'] for rank in ranks]
-rss = [summary[rank]['rss'] for rank in ranks]
-evar = [summary[rank]['evar'] for rank in ranks]    
-coph = [summary[rank]['cophenetic'] for rank in ranks]
-disp = [summary[rank]['dispersion'] for rank in ranks]
-spar_w, spar_h = zip(*spar)
-        
-fig, axs = plt.subplots(2, 3, figsize=(15, 10)) 
-
-axs[0, 0].plot(ranks, rss, 'o-', label='RSS', linewidth=2)
-axs[0, 0].set_title('RSS')
-axs[0, 1].plot(ranks, coph, 'o-', label='Cophenetic correlation', linewidth=2)
-axs[0, 1].set_title('Cophenetic correlation')
-axs[0, 2].plot(ranks, disp, 'o-', label='Dispersion', linewidth=2)
-axs[0, 2].set_title('Dispersion')
-axs[1, 0].plot(ranks, spar_w, 'o-', label='Sparsity (Basis)', linewidth=2)
-axs[1, 0].set_title('Sparsity (Basis)')
-axs[1, 1].plot(ranks, spar_h, 'o-', label='Sparsity (Mixture)', linewidth=2)
-axs[1, 1].set_title('Sparsity (Mixture)')
-axs[1, 2].plot(ranks, evar, 'o-', label='Explained variance', linewidth=2)
-axs[1, 2].set_title('Explained variance')
-
-from matplotlib.ticker import MaxNLocator
-for ax in axs.flat:
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-savefig("p3.png", dpi=300)
-
-snmf = nimfa.Snmf(V, seed="random_c", rank=8, max_iter=30, version='r')
-snmf_fit = snmf()
- 
-W = pl.DataFrame(snmf_fit.basis()).explode(pl.all())\
-    .rename(lambda col: col.replace('column_', 'S'))
-to_r(W, 'W', format='df', rownames=var['_index'].filter(gene_mask))
-
-H = pl.DataFrame(snmf_fit.coef()).explode(pl.all())
-H.columns = obs['ID']
-to_r(H, 'H', format='df', rownames=W.columns)
-
-
-
-
 def peek_metagenes(study_name, cell_type):
     W = pd.read_table(f'results/NMF/{study_name}/{cell_type}_W{save_name}.tsv',
                       index_col=0)
@@ -119,25 +196,7 @@ def peek_metagenes(study_name, cell_type):
 peek_metagenes('p400','Inhibitory')
 
 
-
-with Timer('Volcano plots'):
-    for cell_type in de['cell_type'].unique():
-        df = de.filter(cell_type=cell_type)
-        plot_volcano(df, threshold=0.1, num_top_genes=30,
-                     min_distance=0.08,
-                     plot_directory='figures/volcano/p400')     
-
-
-
-
-
-
-
-
-
-
-
-
+ 
 
 
 

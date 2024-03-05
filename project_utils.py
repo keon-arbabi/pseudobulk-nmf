@@ -1,9 +1,39 @@
-import polars as pl 
-import pandas as pd
-import numpy as np
+import os
+import polars as pl, pandas as pd, numpy as np
 import matplotlib.pylab as plt
-import os 
 from utils import savefig
+
+def normalize_matrix(mat, norm_method):
+    
+    from scipy.stats import rankdata
+    from utils import inverse_normal_transform
+    
+    if not np.isfinite(mat).all():
+        raise ValueError('Matrix contains NaN, infinity, or missing values')
+    if np.any(np.ptp(mat, axis=1) == 0):
+        raise ValueError("Matrix contains rows with constant values")
+    if norm_method == 'median' or norm_method == 'mean':
+        shift = abs(np.min(mat))
+        mat += shift
+        if norm_method == 'median':
+            norm_factor = np.median(mat, axis=1)[:, None]
+        else:  
+            norm_factor = np.mean(mat, axis=1)[:, None]
+        mat /= norm_factor
+    elif norm_method == 'minmax':
+        mat -= np.min(mat, axis=1)[:, None]
+        mat /= np.max(mat, axis=1)[:, None]
+    elif norm_method == 'quantile':
+        mat = np.apply_along_axis(rankdata, 1, mat) - 1
+        mat /= (mat.shape[1] - 1)  
+    elif norm_method == 'rint':
+        mat = np.apply_along_axis(inverse_normal_transform, 1, mat)
+        mat += abs(np.min(mat))
+    else:
+        raise ValueError(f"Unknown method: {norm_method}") 
+    return mat
+
+# Plotting #####################################################################
 
 def plot_volcano(df, significance_column='FDR', threshold=0.05, 
                  label_top_genes=True, num_top_genes=30, min_distance=0.1,
@@ -62,7 +92,7 @@ def plot_k_MSE(axes, idx, cell_type, MSE_trial,
         if current_cell_type == cell_type:
             mean_MSE = MSE.groupby('k').mean()
             k_1se = k_1se_trial[current_cell_type, current_beta]
-            alpha = 0.4 + ((best_beta - 1e-6) * (0.8 - 0.4) / (1e-1 - 1e-6))
+            alpha = 0.4 + ((best_beta - 1e-6) * (0.6 - 0.2) / (1e-1 - 1e-6))
             ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=alpha)
             ax.scatter(k_1se, mean_MSE[k_1se], color='black', s=16, alpha=alpha)
     mean_MSE = MSE_final.groupby('k').mean()
@@ -71,10 +101,10 @@ def plot_k_MSE(axes, idx, cell_type, MSE_trial,
     ax.scatter(k_final, mean_MSE[k_final], color='red', s=50)
     ax.set_xticks(ticks=mean_MSE.index)
     ax.set_yscale('log')
-    ax.set_title(f"**{cell_type}**"
+    ax.set_title(rf'$\mathbf{{{cell_type}}}$'
                 + "\nMSE across Optuna trials\n"
                 + f"Best k: {k_final}, "
-                + f"Best beta: {best_beta:.3f}")
+                + f"Best beta: {best_beta:.2g}")
     ax.set_xlabel('k')
     ax.set_ylabel('Mean MSE')
     
