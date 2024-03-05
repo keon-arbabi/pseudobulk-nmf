@@ -1,25 +1,79 @@
 
+
+from matplotlib.colors import ListedColormap
+
+data1 = mat[0:50, 0:50] 
+data2 = mask[0:50, 0:50]
+fig, ax = plt.subplots(figsize=(5,5))    
+sns.heatmap(data1, cbar=False, xticklabels=False, yticklabels=False,
+            rasterized=True)
+sns.heatmap(data2, cmap = ListedColormap(['white']), 
+            cbar=False, xticklabels=False, yticklabels=False,
+            rasterized=True, square=True, mask=data2)
+savefig('tmp2.png')
+
+fig, ax = plt.subplots(figsize=(5,5))    
+sns.heatmap(data1, cbar=False, xticklabels=False, yticklabels=False,
+            square=True, rasterized=True)
+savefig('tmp1.png')
+
+data3 = mat_est[0:50, 0:50]
+fig, ax = plt.subplots(figsize=(5,5))    
+sns.heatmap(data3, cbar=False, xticklabels=False, yticklabels=False,
+            square=True, rasterized=True)
+savefig('tmp3.png')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+de = pl.read_csv('results/differential-expression/p400_broad.csv')
+lcpm = Pseudobulk('data/pseudobulk/p400_qcd')\
+    .drop(Pseudobulk.get_num_DE_hits(de, threshold=0.1)\
+            .filter(pl.col.num_hits < 100)['cell_type'])\
+    .filter_obs(pmAD=1)\
+    .log_CPM(prior_count=2)
+
 cell_type = 'Inhibitory'
 X = lcpm.X[cell_type]
 obs = lcpm.obs[cell_type]
 var = lcpm.var[cell_type]
 
-gene_mask = var['_index'].is_in(
-    de.filter((pl.col.cell_type==cell_type) & (pl.col.FDR < 0.1))['gene']) 
-V = X.T[gene_mask, :] 
+gene_mask = var['_index'].is_in(de.filter(
+        (pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene'])
+mat = X.T[gene_mask] 
+mat = normalize_matrix(mat, 'rint')
 
 import nimfa
-snmf = nimfa.Snmf(V)
+
+
+snmf = nimfa.Snmf(mat, seed='random_vcol', version='l', 
+                  max_iter=10, track_factor=True, track_error=True)
+
+snmf.select_features()
 
 ranks = range(1, 20, 1)
-summary = snmf.estimate_rank(rank_range=ranks, n_run=30, what='all')
+summary = snmf.estimate_rank(rank_range=ranks, n_run=10, what='all')
 summary[1].keys()
-    
+
+spar = [summary[rank]['sparseness'] for rank in ranks]
 rss = [summary[rank]['rss'] for rank in ranks]
+evar = [summary[rank]['evar'] for rank in ranks]    
 coph = [summary[rank]['cophenetic'] for rank in ranks]
 disp = [summary[rank]['dispersion'] for rank in ranks]
-evar = [summary[rank]['evar'] for rank in ranks]    
-spar = [summary[rank]['sparseness'] for rank in ranks]
 spar_w, spar_h = zip(*spar)
         
 fig, axs = plt.subplots(2, 3, figsize=(15, 10)) 
@@ -52,6 +106,27 @@ to_r(W, 'W', format='df', rownames=var['_index'].filter(gene_mask))
 H = pl.DataFrame(snmf_fit.coef()).explode(pl.all())
 H.columns = obs['ID']
 to_r(H, 'H', format='df', rownames=W.columns)
+
+
+
+
+def peek_metagenes(study_name, cell_type):
+    W = pd.read_table(f'results/NMF/{study_name}/{cell_type}_W{save_name}.tsv',
+                      index_col=0)
+    print(pd.DataFrame({col: W.nlargest(20, col).index.tolist()
+                        for col in W.columns}))
+
+peek_metagenes('p400','Inhibitory')
+
+
+
+with Timer('Volcano plots'):
+    for cell_type in de['cell_type'].unique():
+        df = de.filter(cell_type=cell_type)
+        plot_volcano(df, threshold=0.1, num_top_genes=30,
+                     min_distance=0.08,
+                     plot_directory='figures/volcano/p400')     
+
 
 
 

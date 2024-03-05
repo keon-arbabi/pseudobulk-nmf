@@ -30,7 +30,7 @@ with Timer('QC single-cell data and pseudobulk'):
         .pseudobulk(ID_column='projid', 
                     cell_type_column='subset',
                     additional_obs=rosmap_pheno)
-    #pb.save('data/pseudobulk/p400')
+    pb.save('data/pseudobulk/p400')
 
 with Timer('QC pseudobulk data'):
     pb = Pseudobulk('data/pseudobulk/p400')
@@ -41,11 +41,11 @@ with Timer('QC pseudobulk data'):
                 .str.count_matches('4').fill_null(strategy='mean'),
             pmi=pl.col.pmi.fill_null(strategy='mean'))\
         .qc(case_control_column='pmAD', 
-            max_standard_deviations=3, 
+            max_standard_deviations=2, 
             min_nonzero_percent=80,
             min_num_cells=10,
             custom_filter=pl.col.pmAD.is_not_null())
-    #pb.save('data/pseudobulk/p400_qcd')
+    pb.save('data/pseudobulk/p400_qcd')
         
 with Timer('Differential expression'):
     pb = Pseudobulk('data/pseudobulk/p400_qcd')
@@ -54,7 +54,7 @@ with Timer('Differential expression'):
             covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
             include_library_size_as_covariate=True,
             voom_plot_directory=None)
-    de.write_csv('results/differential-expression/p400_broad.csv')     
+    #de.write_csv('results/differential-expression/p400_broad.csv')     
 
 print(Pseudobulk.get_num_DE_hits(de, threshold=0.1).sort('cell_type'))
 print_df(Pseudobulk.get_DE_hits(de, threshold=1, num_top_hits=20)\
@@ -70,6 +70,16 @@ cell_type         num_hits
  OPCs              7        
  Oligodendrocytes  361       
  
+cell_type         num_hits 
+ Astrocytes        568      
+ CUX2+             1305     
+ Endothelial       2        
+ Inhibitory        601      
+ Microglia         21       
+ OPCs              4        
+ Oligodendrocytes  289      
+shape: (7, 2)
+ 
 '''
 ################################################################################
 
@@ -77,34 +87,34 @@ def nmf_objective(trial, mat, MSE_trial, k_1se_trial, study_name,
                   cell_type, k_max, L1=True, L2=False):
     
     from scipy.stats import sem
-    r('library(RcppML, quietly=TRUE)')
-    r('options(RcppML.verbose=TRUE)')
+    r('''library(RcppML, quietly = TRUE)
+    if (is.null(getOption("RcppML.verbose"))) options(RcppML.verbose = TRUE)
+    if (is.null(getOption("RcppML.threads"))) options(RcppML.threads = 0)''')
 
-    L1_w = trial.suggest_float('L1_w', 0.001, 0.999, log=True) if L1 else 0
-    L1_h = trial.suggest_float('L1_h', 0.001, 0.999, log=True) if L1 else 0
-    L2_w = trial.suggest_float('L2_w', 0.001, 0.999, log=True) if L2 else 0
-    L2_h = trial.suggest_float('L2_h', 0.001, 0.999, log=True) if L2 else 0
+    L1_w = trial.suggest_float('L1_w', 0.001, 0.999, log=False) if L1 else 0
+    L1_h = trial.suggest_float('L1_h', 0.001, 0.999, log=False) if L1 else 0
+    L2_w = trial.suggest_float('L2_w', 1e-5, 1e-1, log=True) if L2 else 0
+    L2_h = trial.suggest_float('L2_h', 1e-5, 1e-1, log=True) if L2 else 0
     to_r(L1_w, "L1_w"); to_r(L1_h, "L1_h")
     to_r(L2_w, "L2_w"); to_r(L2_h, "L2_h")
     
-    #r('seed = sample(1:1000, 1, replace=FALSE)')
-    r('MSE = RcppML::crossValidate(mat, k = seq(1, k_max, 1), '
-        'L1 = c(L1_w, L1_h), L2 = c(L2_w, L2_h), '
-        'seed = 1, reps = 3, tol = 1e-2, '
-        'maxit = .Machine$integer.max)')
+    r('''MSE = RcppML::crossValidate(
+        mat, k = seq(1, k_max, 1), 
+        L1 = c(L1_w, L1_h), L2 = c(L2_w, L2_h), 
+        seed = 0, reps = 3, tol = 1e-2, 
+        maxit = .Machine$integer.max)''')
     
-    MSE = to_py('MSE', format='pandas')\
-        .astype({'k': int, 'rep': int})\
-        .set_index(['k', 'rep'])\
-        .squeeze()\
-        .rename('MSE')
+    MSE = to_py('MSE', format='pandas').astype({'k': int, 'rep': int})\
+        .set_index(['k', 'rep']).squeeze().rename('MSE')
     mean_MSE = MSE.groupby('k').mean()
     k_best = int(mean_MSE.idxmin())
     k_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[k_best] +\
         sem(MSE[k_best])][0])
+    
     MSE_trial[study_name, cell_type, L1_w, L1_h, L2_w, L2_h] = MSE
     k_1se_trial[study_name, cell_type, L1_w, L1_h, L2_w, L2_h] = k_1se
     print(f'[{study_name} {cell_type}]: {k_1se=}')
+    
     error = mean_MSE[k_1se]
     return error
 
@@ -117,16 +127,14 @@ def plot_MSE(axes, idx, study_name, cell_type, MSE_trial,
         if current_study == study_name and current_cell_type == cell_type:
             mean_MSE = MSE.groupby('k').mean()
             k_1se = k_1se_trial[study_name, cell_type, L1_w, L1_h, L2_w, L2_h]
-            
-            ax.plot(mean_MSE.index, mean_MSE.values, color='black', 
-                    alpha=0.08)
-            ax.scatter(k_1se, mean_MSE[k_1se], color='black', s=16, 
-                       alpha=0.08)
+            alpha = min(1, sum(best_params.values()) / 4) ** (1/2) 
+            ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=alpha)
+            ax.scatter(k_1se, mean_MSE[k_1se], color='black', s=16, alpha=alpha)
     mean_MSE = MSE_final.groupby('k').mean()
     k_final = k_1se_trial[study_name, cell_type, *best_params.values()]
     ax.plot(mean_MSE.index, mean_MSE.values, color='red')
     ax.scatter(k_final, mean_MSE[k_final], color='red', s=50)
-    ax.set_xticks(ticks=mean_MSE.index)
+    #ax.set_xticks(ticks=mean_MSE.index)
     ax.set_yscale('log')
     ax.set_title(rf"$\bf{{{study_name}\;{cell_type}}}$"
                 + "\nMSE across Optuna trials\n"
@@ -144,10 +152,14 @@ lcpm = Pseudobulk('data/pseudobulk/p400_qcd')\
     .filter_obs(pmAD=1)\
     .log_CPM(prior_count=2)
 
+
+norm = 'rint'
+L1 = True
+L2 = False
+n_trials = 30
+k_max = 50; to_r(k_max, 'k_max')
 study_name = 'p400'
-save_name = ''
-n_trials = 10
-k_max = 20; to_r(k_max, 'k_max')
+save_name = '_rint_L1'; to_r(save_name, 'save_name')
 
 MSE_trial, k_1se_trial = {}, {}
 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -156,7 +168,7 @@ for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
     gene_mask = var['_index'].is_in(de.filter(
             (pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene'])
     mat = X.T[gene_mask] 
-    mat = normalize_matrix(mat, 'rint')
+    mat = normalize_matrix(mat, norm)
     to_r(mat, 'mat', format='matrix')
     
     study = optuna.create_study(
@@ -165,7 +177,7 @@ for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
         direction='minimize')
     study.optimize(lambda trial: nmf_objective(
         trial, mat, MSE_trial, k_1se_trial,\
-        study_name, cell_type, k_max, L1=True, L2=False), 
+        study_name, cell_type, k_max, L1=L1, L2=L2), 
         n_trials=n_trials)
 
     best_params = {param: study.best_trial.params.get(param, 0)
@@ -176,13 +188,10 @@ for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
     to_r(k_select, 'k_select')
     to_r(best_params, 'bp')
     r('''
-        library(RcppML, quietly=True)
-        options(RcppML.verbose = TRUE)
-        res = nmf(mat, k = k_select, 
+      res = nmf(mat, k = k_select, 
                 L1=c(bp$L1_w, bp$L1_h), L2=c(bp$L2_w, bp$L2_h), 
-                seed=1:10, tol=1e-5, maxit=.Machine$integer.max)
-        H = res@h
-        W = res@w
+                seed=1:50, tol=1e-5, maxit=.Machine$integer.max)
+        H = res@h; W = res@w
     ''')
     W = to_py('W', format='pandas')\
         .set_axis(var.filter(gene_mask)['_index'].to_list())\
@@ -193,14 +202,120 @@ for idx, (cell_type, (X, obs, var)) in enumerate(lcpm.items()):
 
     os.makedirs(f'results/MSE/{study_name}', exist_ok=True)
     os.makedirs(f'results/NMF/{study_name}', exist_ok=True)
-    MSE_final.to_csv(f'results/MSE/{study_name}/{cell_type}_MSE{save_name}.tsv', sep='\t')
+    MSE_final.to_csv(
+        f'results/MSE/{study_name}/{cell_type}_MSE{save_name}.tsv', sep='\t')
     W.to_csv(f'results/NMF/{study_name}/{cell_type}_W{save_name}.tsv', sep='\t')
     H.to_csv(f'results/NMF/{study_name}/{cell_type}_H{save_name}.tsv', sep='\t')
 
     plot_MSE(axes, idx, study_name, cell_type,
              MSE_trial, k_1se_trial, MSE_final, best_params)
-fig.subplots_adjust(left=0.1, right=0.9, bottom=0.1, top=0.9, wspace=0.4, hspace=0.4)
+fig.subplots_adjust(left=0.1, right=0.9, bottom=0.1,
+                    top=0.9, wspace=0.4, hspace=0.4)
 savefig(f"results/MSE/{study_name}/MSE_plots{save_name}.png", dpi=300)
+
+
+for cell_type, (X, obs, var) in lcpm.items():
+    gene_mask = var['_index'].is_in(
+        de.filter((pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene']) 
+    mat = X.T[gene_mask] 
+    mat = normalize_matrix(mat, norm)
+    
+    to_r(mat, 'mat', format='matrix',
+        rownames=var['_index'].filter(gene_mask),
+        colnames=obs['ID'])
+    to_r(cell_type, 'cell_type')
+    meta = obs.select(sorted([
+        'num_cells', 'sex', 'Cdx', 'braaksc', 'ceradsc', 'pmi', 'niareagansc',
+        'apoe_genotype', 'tomm40_hap','age_death', 'age_first_ad_dx', 'cogdx',
+        'ad_reagan', 'gpath', 'amyloid', 'hspath_typ', 'dlbdx', 'tangles',
+        'tdp_st4', 'arteriol_scler', 'caa_4gp', 'cvda_4gp2','ci_num2_gct',
+        'ci_num2_mct', 'tot_cog_res']))
+    to_r(meta, 'meta', format='data.frame', rownames=obs['ID'])
+    
+    W = pd.read_table(
+        f'results/NMF/{study_name}/{cell_type}_W{save_name}.tsv', index_col=0)
+    H = pd.read_table(
+        f'results/NMF/{study_name}/{cell_type}_H{save_name}.tsv', index_col=0)
+    H.index = H.index.astype(str)
+    to_r(W, "W", format='data.frame')
+    to_r(H, "H", format='data.frame')
+    
+    r('''
+    suppressPackageStartupMessages({
+            library(ComplexHeatmap)
+            library(circlize)
+            library(seriation)
+            library(scico)
+        })
+        # row_order = get_order(seriate(dist(mat), method = "OLO"))
+        # col_order = get_order(seriate(dist(t(mat)), method = "OLO"))
+        row_order = get_order(seriate(dist(W), method = "OLO"))
+        col_order = get_order(seriate(dist(H), method = "OLO"))
+        
+        create_color_list = function(data, palette) {
+            cols = scico(ncol(data), palette = palette)
+            col_funs = mapply(function(col, max_val) {
+                colorRamp2(c(0, max_val), c("white", col))
+            }, cols, apply(data, 2, max), SIMPLIFY = FALSE)
+            setNames(col_funs, colnames(data))
+        }
+        col_list_H = create_color_list(H, "batlow")
+        col_list_W = create_color_list(W, "batlow")
+
+        ht = HeatmapAnnotation(
+            df = meta,
+            simple_anno_size = unit(0.15, "cm"),
+            annotation_name_gp = gpar(fontsize = 5),
+            show_legend = FALSE)     
+        hb = HeatmapAnnotation(
+            df = H, col = col_list_H,
+            simple_anno_size = unit(0.3, "cm"),
+            annotation_name_gp = gpar(fontsize = 8),
+            show_legend = FALSE)         
+        hr = rowAnnotation(
+            df = W, col = col_list_W,
+            simple_anno_size = unit(0.3, "cm"),
+            annotation_name_gp = gpar(fontsize = 8),
+            show_legend = FALSE)
+        col_fun = colorRamp2(quantile(mat, probs = c(0.00, 1.00)), 
+            hcl_palette = "Batlow", reverse = TRUE)
+        file_name = paste0("figures/A_matrix/p400/", cell_type, 
+                    save_name, ".png")
+        png(file = file_name, width=7, height=7, units="in", res=1200)
+        h = Heatmap(
+            mat,
+            row_order = row_order,
+            column_order = col_order,
+            cluster_rows = F,
+            cluster_columns = F,
+            show_row_names = FALSE,
+            show_column_names = FALSE,
+            #top_annotation = ht,
+            bottom_annotation = hb,
+            left_annotation = hr,
+            col = col_fun,
+            name = paste0('p400', "\n", cell_type),
+            heatmap_legend_param = list(
+                title_gp = gpar(fontsize = 7, fontface = "bold")),
+            show_heatmap_legend = TRUE
+        )
+        draw(h)
+        dev.off()
+    ''')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -211,25 +326,44 @@ lcpm = Pseudobulk('data/pseudobulk/p400_qcd')\
             .filter(pl.col.num_hits < 100)['cell_type'])\
     .filter_obs(pmAD=1)\
     .log_CPM(prior_count=2)
-
+    
 cell_type = 'Inhibitory'
 X = lcpm.X[cell_type]
 obs = lcpm.obs[cell_type]
 var = lcpm.var[cell_type]
-
 gene_mask = var['_index'].is_in(de.filter(
         (pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene'])
+
 mat = X.T[gene_mask] 
 mat = normalize_matrix(mat, 'rint')
 
-import nimfa
+def cross_validate(mat, kmax, reps=3, n=0.05, verbose=False):
+    import nimfa    
+    from scipy.stats import sem 
+    res = []
+    for rep in range(1, reps + 1):
+        mask = np.random.rand(*mat.shape) < (1 - n) 
+        mat_masked = mat * mask 
+        for k in range(1, kmax + 1):
+            snmf = nimfa.Snmf(mat_masked, rank=k, version='l', 
+                              max_iter=30, n_run=1)
+            snmf_fit = snmf()
+            mat_est = np.asarray(snmf_fit.fitted())
+            MSE = np.mean((mat[~mask] - mat_est[~mask]) ** 2)
+            if verbose:      
+                print(f'rep {rep}, rank: {k}, MSE: {MSE}')
+            res.append((rep, k, MSE))
+            
+    MSE = pd.DataFrame(res, columns=['k', 'rep', 'MSE'])\
+        .set_index(['k', 'rep'])['MSE']
+        
+    mean_MSE = MSE.groupby('k').mean()
+    k_best = int(mean_MSE.idxmin())
+    k_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[k_best] + \
+        sem(MSE[k_best])][0])
 
-mat_m = 
 
-snmf = nimfa.Snmf(mat, seed='random_vcol', version='l', 
-                  max_iter=10, track_factor=True, track_error=True)
 
-snmf.select_features()
 
 ranks = range(1, 20, 1)
 summary = snmf.estimate_rank(rank_range=ranks, n_run=10, what='all')
@@ -272,148 +406,6 @@ to_r(W, 'W', format='df', rownames=var['_index'].filter(gene_mask))
 H = pl.DataFrame(snmf_fit.coef()).explode(pl.all())
 H.columns = obs['ID']
 to_r(H, 'H', format='df', rownames=W.columns)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def peek_metagenes(study_name, cell_type):
-    W = pd.read_table(f'results/NMF/{study_name}/{cell_type}_W{save_name}.tsv',
-                      index_col=0)
-    print(pd.DataFrame({col: W.nlargest(20, col).index.tolist()
-                        for col in W.columns}))
-
-peek_metagenes('p400','Inhibitory')
-
-
-
-with Timer('Volcano plots'):
-    for cell_type in de['cell_type'].unique():
-        df = de.filter(cell_type=cell_type)
-        plot_volcano(df, threshold=0.1, num_top_genes=30,
-                     min_distance=0.08,
-                     plot_directory='figures/volcano/p400')     
-
-
-
-for cell_type, (X, obs, var) in lcpm.items():
-    gene_mask = var['_index'].is_in(
-        de.filter((pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene']) 
-    mat = X.T[gene_mask] 
-    mat = normalize_matrix(mat, 'rint')
-    
-    to_r(mat, 'mat', format='matrix',
-        rownames=var['_index'].filter(gene_mask),
-        colnames=obs['ID'])
-    to_r(cell_type, 'cell_type')
-    meta = obs.select(sorted([
-        'num_cells', 'sex', 'Cdx', 'braaksc', 'ceradsc', 'pmi', 'niareagansc',
-        'apoe_genotype', 'tomm40_hap','age_death', 'age_first_ad_dx', 'cogdx',
-        'ad_reagan', 'gpath', 'amyloid', 'hspath_typ', 'dlbdx', 'tangles',
-        'tdp_st4', 'arteriol_scler', 'caa_4gp', 'cvda_4gp2','ci_num2_gct',
-        'ci_num2_mct', 'tot_cog_res']))
-    to_r(meta, 'meta', format='data.frame', rownames=obs['ID'])
-    
-    W = pd.read_table(
-        f'results/NMF/{study_name}/{cell_type}_W{save_name}.tsv', index_col=0)
-    H = pd.read_table(
-        f'results/NMF/{study_name}/{cell_type}_H{save_name}.tsv', index_col=0)
-    H.index = H.index.astype(str)
-    to_r(W, "W", format='data.frame')
-    to_r(H, "H", format='data.frame')
-    
-    r('''
-    suppressPackageStartupMessages({
-            library(ComplexHeatmap)
-            library(circlize)
-            library(seriation)
-            library(scico)
-        })
-        row_order = get_order(seriate(dist(W), method = "OLO"))
-        col_order = get_order(seriate(dist(H), method = "OLO"))
-        ht = HeatmapAnnotation(
-            df = meta, 
-            simple_anno_size = unit(0.15, "cm"),
-            annotation_name_gp = gpar(fontsize = 5),
-            show_legend = FALSE)     
-        hb = HeatmapAnnotation(
-            df = H, 
-            simple_anno_size = unit(0.3, "cm"),
-            annotation_name_gp = gpar(fontsize = 8),
-            show_legend = FALSE)         
-        hr = rowAnnotation(
-            df = W,
-            simple_anno_size = unit(0.3, "cm"),
-            annotation_name_gp = gpar(fontsize = 8),
-            show_legend = FALSE)
-        col_fun = colorRamp2(quantile(mat, probs = c(0.00, 1.00)), 
-            hcl_palette = "Batlow", reverse = TRUE)
-        file_name = paste0("figures/explore/p400/", cell_type,
-                            "_rint.png")
-        png(file = file_name, width=7, height=7, units="in", res=1200)
-        h = Heatmap(
-            mat,
-            row_order = row_order,
-            column_order = col_order,
-            cluster_rows = F,
-            cluster_columns = F,
-            show_row_names = FALSE,
-            show_column_names = FALSE,
-            top_annotation = ht,
-            bottom_annotation = hb,
-            left_annotation = hr,
-            col = col_fun,
-            name = paste0('p400', "\n", cell_type),
-            show_heatmap_legend = TRUE
-        )
-        draw(h)
-        dev.off()
-    ''')
-
 
 
 

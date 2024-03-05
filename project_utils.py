@@ -24,7 +24,6 @@ def plot_volcano(df, significance_column='FDR', threshold=0.05,
 
     plt.figure(figsize=(6, 8))
     plt.scatter(df['logFC'], df['logP'], c=df['color'], alpha=alpha, s=size)
-
     if label_top_genes:
         for direction in ['up', 'down']:
             top_genes = \
@@ -39,7 +38,6 @@ def plot_volcano(df, significance_column='FDR', threshold=0.05,
                 for _, gene in filtered_genes.iterrows():
                     plt.text(gene['logFC'], gene['logP'], gene['gene'],
                              fontweight='semibold', fontsize=8)
-
     plt.title(f"{df['cell_type'].unique()[0]}")
     plt.xlabel(r'$\log_2(Fold Change)$')
     plt.ylabel(r'$-\log_{10}(P-value)$')
@@ -48,7 +46,6 @@ def plot_volcano(df, significance_column='FDR', threshold=0.05,
         for color, label in zip(colors, ['down', '', 'up'])]
     plt.legend(handles=legend_patches, 
                title=f"{significance_column} < {threshold}", loc='best')
-    
     if plot_directory is not None:
         filename = (
             f"{df['cell_type'].unique()[0].replace('/', '-')}"
@@ -56,88 +53,34 @@ def plot_volcano(df, significance_column='FDR', threshold=0.05,
         )
         plot_file = os.path.join(plot_directory, filename)
         plt.savefig(plot_file)
+        
 
 def normalize_matrix(mat, norm_method):
     
     from scipy.stats import rankdata
     from utils import inverse_normal_transform
-
-    if norm_method == 'median':
-        mat += abs(np.min(mat))
-        mat /= np.median(mat, axis=1)[:, None]
-    elif norm_method == 'mean':
-        mat /= np.mean(mat, axis=1)[:, None]
-    elif norm_method == 'min-max':
+    
+    if not np.isfinite(mat).all():
+        raise ValueError('Matrix contains NaN, infinity, or missing values')
+    if np.any(np.ptp(mat, axis=1) == 0):
+        raise ValueError("Matrix contains rows with constant values")
+    if norm_method == 'median' or norm_method == 'mean':
+        shift = abs(np.min(mat))
+        mat += shift
+        if norm_method == 'median':
+            norm_factor = np.median(mat, axis=1)[:, None]
+        else:  
+            norm_factor = np.mean(mat, axis=1)[:, None]
+        mat /= norm_factor
+    elif norm_method == 'minmax':
         mat -= np.min(mat, axis=1)[:, None]
         mat /= np.max(mat, axis=1)[:, None]
     elif norm_method == 'quantile':
-        mat = np.apply_along_axis(rankdata, 1, mat)
+        mat = np.apply_along_axis(rankdata, 1, mat) - 1
+        mat /= (mat.shape[1] - 1)  
     elif norm_method == 'rint':
         mat = np.apply_along_axis(inverse_normal_transform, 1, mat)
-        mat += abs(np.min(mat) + 1)
+        mat += abs(np.min(mat))
     else:
-        raise ValueError(f"Unknown method: {norm_method}")
+        raise ValueError(f"Unknown method: {norm_method}") 
     return mat
-
-def plot_A_heatmap(mat, obs, var, cell_type, rownames, filename):
-
-    from ryp import r, to_r    
-
-    to_r(mat, 'mat', format='df',
-        rownames=rownames,
-        colnames=obs['ID'])
-    to_r(cell_type, 'cell_type')
-    meta = obs.select(sorted([
-        'num_cells', 'sex', 'Cdx', 'braaksc', 'ceradsc', 'pmi', 'niareagansc',
-        'apoe_genotype', 'tomm40_hap','age_death', 'age_first_ad_dx', 'cogdx',
-        'ad_reagan', 'gpath', 'amyloid', 'hspath_typ', 'dlbdx', 'tangles',
-        'tdp_st4', 'arteriol_scler', 'caa_4gp', 'cvda_4gp2','ci_num2_gct',
-        'ci_num2_mct', 'tot_cog_res']))
-    to_r(meta, 'meta', format='df', rownames=obs['ID'])
-    
-    r('''
-    suppressPackageStartupMessages({
-            library(ComplexHeatmap)
-            library(circlize)
-            library(seriation)
-        })
-        row_order = get_order(seriate(dist(mat), method = "OLO"))
-        col_order = get_order(seriate(dist(t(mat)), method = "OLO"))
-        ht = HeatmapAnnotation(
-            df = meta,
-            simple_anno_size = unit(0.15, "cm"),
-            annotation_name_gp = gpar(fontsize = 5),
-            show_legend = FALSE)     
-        # hb = HeatmapAnnotation(
-        #     df = t(H),
-        #     simple_anno_size = unit(0.3, "cm"),
-        #     annotation_name_gp = gpar(fontsize = 8),
-        #     show_legend = FALSE)         
-        # hr = rowAnnotation(
-        #     df = W,
-        #     simple_anno_size = unit(0.3, "cm"),
-        #     annotation_name_gp = gpar(fontsize = 8),
-        #     show_legend = FALSE)
-        col_fun = colorRamp2(quantile(mat, probs = c(0.00, 1.00)), 
-            hcl_palette = "Batlow", reverse = TRUE)
-        file_name = paste0("figures/explore/p400/", cell_type,
-                            "_rint.png")
-        png(file = file_name, width=7, height=7, units="in", res=1200)
-        h = Heatmap(
-            mat,
-            row_order = row_order,
-            column_order = col_order,
-            cluster_rows = F,
-            cluster_columns = F,
-            show_row_names = FALSE,
-            show_column_names = FALSE,
-            top_annotation = ht,
-            # bottom_annotation = hb,
-            # left_annotation = hr,
-            col = col_fun,
-            name = paste0('p400', "\n", cell_type),
-            show_heatmap_legend = TRUE
-        )
-        draw(h)
-        dev.off()
-    ''')
