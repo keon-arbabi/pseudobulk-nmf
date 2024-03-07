@@ -1,3 +1,67 @@
+
+plot_3M_heatmap <- function(mat, H, W, celltype, 
+                            cluster = c('factors', 'matrix'), save_name="") {
+
+  suppressPackageStartupMessages({
+          library(ComplexHeatmap)
+          library(circlize)
+          library(seriation)
+          library(scico)
+  })
+  # row_order = get_order(seriate(dist(mat), method = "OLO"))
+  # col_order = get_order(seriate(dist(t(mat)), method = "OLO"))
+  row_order = get_order(seriate(dist(W), method = "OLO"))
+  col_order = get_order(seriate(dist(H), method = "OLO"))
+
+  create_color_list = function(data, palette) {
+      n = ncol(data)
+      cols = scico(n+3, palette = palette)[1:n]
+      col_funs = mapply(function(col, max_val) {
+          colorRamp2(c(0, max_val), c("white", col))
+      }, cols, apply(data, 2, max), SIMPLIFY = FALSE)
+      setNames(col_funs, colnames(data))
+  }
+  col_list_H = create_color_list(H, "batlow")
+  col_list_W = create_color_list(W, "batlow")
+
+  hb = HeatmapAnnotation(
+      df = H, col = col_list_H,
+      simple_anno_size = unit(0.5, "cm"),
+      annotation_name_gp = gpar(fontsize = 8),
+      show_legend = FALSE)         
+  hr = rowAnnotation(
+      df = W, col = col_list_W,
+      simple_anno_size = unit(0.5, "cm"),
+      annotation_name_gp = gpar(fontsize = 8),
+      show_legend = FALSE)
+  col_fun = colorRamp2(quantile(mat, probs = c(0.00, 1.00)), 
+      hcl_palette = "Batlow", reverse = TRUE)
+  file_name = paste0("figures/NMF/A/p400/", cell_type, 
+              save_name, ".png")
+  png(file = file_name, width=7, height=7, units="in", res=1200)
+  h = Heatmap(
+      mat,
+      row_order = row_order,
+      column_order = col_order,
+      cluster_rows = F,
+      cluster_columns = F,
+      show_row_names = FALSE,
+      show_column_names = FALSE,
+      #top_annotation = ht,
+      bottom_annotation = hb,
+      left_annotation = hr,
+      col = col_fun,
+      name = paste0('p400', "\n", cell_type),
+      heatmap_legend_param = list(
+          title_gp = gpar(fontsize = 7, fontface = "bold")),
+      show_heatmap_legend = TRUE
+  )
+  draw(h)
+  dev.off()
+}
+
+################################################################################
+
 voomByGroup <- function(counts, group = NULL, design = NULL, lib.size = NULL,
                         dynamic = NULL, normalize.method = "none",
                         span = 0.5, save.plot = TRUE, print = TRUE,

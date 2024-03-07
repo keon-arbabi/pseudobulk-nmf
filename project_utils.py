@@ -92,9 +92,9 @@ def plot_k_MSE(axes, idx, cell_type, MSE_trial,
         if current_cell_type == cell_type:
             mean_MSE = MSE.groupby('k').mean()
             k_1se = k_1se_trial[current_cell_type, current_beta]
-            alpha = 0.4 + ((best_beta - 1e-6) * (0.6 - 0.2) / (1e-1 - 1e-6))
-            ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=alpha)
-            ax.scatter(k_1se, mean_MSE[k_1se], color='black', s=16, alpha=alpha)
+            #alpha = 0.4 + ((best_beta - 1e-6) * (0.6 - 0.2) / (1e-1 - 1e-6))
+            ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=0.4)
+            ax.scatter(k_1se, mean_MSE[k_1se], color='black', s=16, alpha=0.4)
     mean_MSE = MSE_final.groupby('k').mean()
     k_final = k_1se_trial[cell_type, best_beta]
     ax.plot(mean_MSE.index, mean_MSE.values, color='red')
@@ -116,7 +116,7 @@ def plot_k_stats(snmf, kmax, cell_type,
     ks = range(1, kmax)
     summary = snmf.estimate_rank(
         rank_range=ks, n_run=1, 
-        what=['sparseness','rss','evar','dispersion'])
+        what=['sparseness','rss','evar', 'dispersion'])
 
     spar = [summary[rank]['sparseness'] for rank in ks]
     rss = [summary[rank]['rss'] for rank in ks]
