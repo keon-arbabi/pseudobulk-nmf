@@ -1,5 +1,151 @@
 
 
+################################################################################
+
+def objective(trial, MSE_trial, r_1se_trial, cell_type, 
+              A, r_max, reps=3, n=0.05, verbose=False):
+    
+    from scipy.stats import sem 
+    m = A.shape[0]
+    spar_l = (np.sqrt(m) - np.sqrt(m - 1)) / (np.sqrt(m) - 1) + 1e-10
+    spar_u = (np.sqrt(m) + np.sqrt(m - 1)) / (np.sqrt(m) - 1) - 1e-10
+    spar = trial.suggest_float('spar', spar_l, spar_u, log=True)
+    
+    MSE = cross_validate(A, r_max, spar, reps, n, verbose)
+    mean_MSE = MSE.groupby('r').mean()
+    r_best = int(mean_MSE.idxmin())
+    r_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[r_best] + \
+        sem(MSE[r_best])][0])
+    
+    MSE_trial[cell_type, spar] = MSE
+    r_1se_trial[cell_type, spar] = r_1se
+    print(f'[{cell_type}]: {r_1se=}')
+    error = mean_MSE[r_1se]
+    return(error)
+
+de = pl.read_csv('results/DE/p400_broad.csv')
+lcpm = Pseudobulk('data/pseudobulk/p400_qcd')\
+    .drop(Pseudobulk.get_num_DE_hits(de, threshold=0.1)\
+            .filter(pl.col.num_hits <= 100)['cell_type'])\
+    .filter_obs(pmAD=1)\
+    .log_CPM(prior_count=2)
+
+r_max = 30
+n_trials = 30
+save_name = '_rint'
+to_r(save_name, 'save_name')
+
+MSE_trial, r_1se_trial, spar_select_trial = {}, {}, {}
+for cell_type, (X, obs, var) in lcpm.items():
+    
+    gene_mask = var['_index'].is_in(de.filter(
+        (pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene'])
+    A = X.T[gene_mask] 
+    A = normalize_matrix(A, 'rint')
+    
+    study = optuna.create_study(
+        sampler=optuna.samplers.TPESampler(seed=0, multivariate=True),
+        #sampler=optuna.samplers.RandomSampler(seed=0),
+        direction='minimize')
+    study.optimize(lambda trial: objective(
+        trial, MSE_trial, r_1se_trial, cell_type, 
+        A, r_max, reps=3, n=0.05, verbose=True), 
+        n_trials=n_trials)
+    spar_select = study.best_trial.params.get('spar', 0)
+    r_select = r_1se_trial[cell_type, spar_select]
+    spar_select_trial[cell_type] = spar_select
+    
+    W, H = sparse_nmf(A, r_select, maxiter=300, spar=spar_select)
+    A_r = W @ H
+    
+    os.makedirs(f'results/NMF/factors/p400', exist_ok=True)    
+    pl.DataFrame(W)\
+        .rename(lambda col: col.replace('column_', 'S'))\
+        .insert_column(0, var.filter(gene_mask)['_index'].alias('gene'))\
+        .write_csv(f'results/NMF/factors/p400/{cell_type}_W{save_name}.tsv',
+                   separator='\t')
+    pl.DataFrame(H.T)\
+        .rename(lambda col: col.replace('column_', 'S'))\
+        .insert_column(0, obs['ID'].alias('ID'))\
+        .write_csv(f'results/NMF/factors/p400/{cell_type}_H{save_name}.tsv', 
+                   separator='\t')
+    A_r = pl.DataFrame(A_r)\
+        .insert_column(0, var.filter(gene_mask)['_index'].alias('gene'))
+    A_r.columns = ['gene'] + obs['ID'].to_list()
+    A_r.write_csv(f'results/NMF/factors/p400/{cell_type}_A_r{save_name}.tsv', 
+            separator='\t')
+    
+# with open('results/NMF/MSE/p400/trial.pkl', 'wb') as file:
+#     pickle.dump((MSE_trial, r_1se_trial, spar_select_trial), file)
+# with open('results/NMF/MSE/p400/trial.pkl', 'rb') as file:
+#     MSE_trial, r_1se_trial, spar_select_trial = pickle.load(file)
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 11))
+for idx, cell_type in enumerate(lcpm.keys()):    
+    row, col = divmod(idx, 2)
+    ax = axes[row, col]
+    MSE_values = []
+    spar_min = min([spar for _, spar in MSE_trial.keys() if _ == cell_type])
+    for (current_cell_type, current_spar), MSE in MSE_trial.items():
+        if current_cell_type == cell_type:
+            mean_MSE = MSE.groupby('r').mean()
+            MSE_values.extend(mean_MSE.values) 
+            r_1se = r_1se_trial[current_cell_type, current_spar]
+            ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=0.1)
+            ax.scatter(r_1se, mean_MSE[r_1se], color='black', s=16, alpha=0.1)
+    spar_select = spar_select_trial[cell_type]
+    MSE_select = MSE_trial[cell_type, spar_select]
+    mean_MSE = MSE_select.groupby('r').mean()
+    r_final = r_1se_trial[cell_type, spar_select]
+    
+    lower, upper = np.quantile(MSE_values, [0, 0.9])
+    ax.set_ylim(bottom=lower-0.05, top=upper)
+    ax.plot(mean_MSE.index, mean_MSE.values, linewidth = 3, color='red')
+    ax.scatter(r_final, mean_MSE[r_final], color='red', s=80)
+    #ax.set_xticks(ticks=mean_MSE.index)
+    ax.set_yscale('log')
+    ax.set_title(rf'$\mathbf{{{cell_type}}}$'
+                + "\nMSE across Optuna trials\n"
+                + f"Best r: {r_final}, "
+                + f"Best spar: {spar_select:.2g}, Min spar: {spar_min:.2g}")
+    ax.set_xlabel('r')
+    ax.set_ylabel('Mean MSE')
+fig.subplots_adjust(bottom=0.1, top=0.9, hspace=0.3, wspace=0.25)
+savefig(f"figures/NMF/MSE/p400/MSE{save_name}.png", dpi=300)
+
+for cell_type, (X, obs, var) in lcpm.items():   
+    gene_mask = var['_index'].is_in(
+        de.filter((pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene']) 
+    A = X.T[gene_mask] 
+    A = normalize_matrix(A, 'rint')
+    to_r(A, 'A', format='matrix',
+        rownames=var['_index'].filter(gene_mask),
+        colnames=obs['ID'])
+    to_r(cell_type, 'cell_type')
+    
+    H = pl.read_csv(f'results/NMF/factors/p400/{cell_type}_H{save_name}.tsv',
+        separator='\t')
+    W = pl.read_csv(f'results/NMF/factors/p400/{cell_type}_W{save_name}.tsv',
+        separator='\t')
+    A_r = pl.read_csv(f'results/NMF/factors/p400/{cell_type}_A_r{save_name}.tsv',
+        separator='\t')
+    to_r(H.select(pl.exclude('ID')), "H",
+         format='data.frame', rownames=H['ID'].cast(str))
+    to_r(W.select(pl.exclude('gene')), "W", 
+         format='data.frame', rownames=W['gene'])
+    to_r(A_r.select(pl.exclude('gene')), 'A_r',
+         format='matrix', rownames=W['gene'])
+    
+    os.makedirs(f'figures/NMF/A/p400', exist_ok=True)
+    r('source("project_utils.R")')
+    r('plot_3M_heatmap(A, H, W, celltype, cluster="factors", save_name)')
+    r('plot_3M_heatmap(A_r, H, W, celltype, cluster="factors", "_rint_r")')
+
+################################################################################
+
+
+
+
 meta = obs.select(sorted([
     'num_cells', 'sex', 'Cdx', 'braaksc', 'ceradsc', 'pmi', 'niareagansc',
     'apoe_genotype', 'tomm40_hap', 'age_death', 'age_first_ad_dx', 'cogdx',

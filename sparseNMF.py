@@ -2,7 +2,7 @@ import numpy as np
 import scipy.io
 import pylab as plt
 
-def sparse_nmf(X, r, maxiter, spar, verbose=False, W = None, H = None):
+def sparse_nmf(X, r, maxiter, spar, seed=0, verbose=False, W = None, H = None):
     """Input data and the rank
 
     Learns a sparse NMF model given data X and the rank r.
@@ -29,7 +29,7 @@ def sparse_nmf(X, r, maxiter, spar, verbose=False, W = None, H = None):
     """
     m, n = np.shape(X)
     if not W and not H:
-        W, H = init_nmf(X, r, spar)
+        W, H = init_nmf(X, r, spar, seed)
     Obj = np.zeros(maxiter)
     for i in range(maxiter):
         Obj[i] = np.linalg.norm(X - np.dot(W, H), 'fro')
@@ -41,7 +41,7 @@ def sparse_nmf(X, r, maxiter, spar, verbose=False, W = None, H = None):
     return W, H
 
 
-def init_nmf(X, r, spar):
+def init_nmf(X, r, spar, seed):
     """ Initialize the matrix factors for NMF.
 
     Use Gaussian random numbers in [-1,1] to initialize
@@ -62,6 +62,7 @@ def init_nmf(X, r, spar):
 
     where X ~ WH
     """
+    np.random.seed(seed)
     m, n = np.shape(X)
     W = np.zeros((m, r))
     k = np.sqrt(m) - spar * (np.sqrt(m) - 1)
