@@ -2,15 +2,15 @@ import numpy as np
 import scipy.io
 import pylab as plt
 
-def sparse_nmf(X, r, maxiter, spar, seed=0, verbose=False, W = None, H = None):
+def sparse_nmf(X, rank, maxiter, spar, seed=None, verbose=False, W = None, H = None):
     """Input data and the rank
 
-    Learns a sparse NMF model given data X and the rank r.
+    Learns a sparse NMF model given data X and the rank rank.
 
     Parameters
     ----------
     X : {array}, shape = [n_features, n_samples]
-    r : rank of factorization
+    rank : rank of factorization
     maxiter : number of updates of the factor matrices
     spar : sparsity of the features given by measure  sp(x)= (sqrt(n)-|x|_1/|x|_2 )/(sqrt(n)-1)
 
@@ -28,8 +28,9 @@ def sparse_nmf(X, r, maxiter, spar, seed=0, verbose=False, W = None, H = None):
     http://arxiv.org/abs/1301.3527
     """
     m, n = np.shape(X)
-    if not W and not H:
-        W, H = init_nmf(X, r, spar, seed)
+    if W is None and H is None:
+        assert seed is not None
+        W, H = init_nmf(X, rank, spar, seed)
     Obj = np.zeros(maxiter)
     for i in range(maxiter):
         Obj[i] = np.linalg.norm(X - np.dot(W, H), 'fro')
@@ -37,11 +38,10 @@ def sparse_nmf(X, r, maxiter, spar, seed=0, verbose=False, W = None, H = None):
             print('iter: {} Obj: {}'.format(i + 1,  Obj[i]))
         W = update_W(X, W, H, spar)
         H = update_H(X, W, H)
-
     return W, H
 
 
-def init_nmf(X, r, spar, seed):
+def init_nmf(X, rank, spar, seed):
     """ Initialize the matrix factors for NMF.
 
     Use Gaussian random numbers in [-1,1] to initialize
@@ -50,7 +50,7 @@ def init_nmf(X, r, spar, seed):
     ----------
 
     X: {array}, shape = [n_features, n_samples]
-    r: rank of factorization
+    rank: rank of factorization
 
     Returns
     -------
@@ -64,26 +64,25 @@ def init_nmf(X, r, spar, seed):
     """
     np.random.seed(seed)
     m, n = np.shape(X)
-    W = np.zeros((m, r))
+    W = np.zeros((m, rank))
     k = np.sqrt(m) - spar * (np.sqrt(m) - 1)
-    for i in range(r):
+    for i in range(rank):
         W[:, i] = sparse_opt(np.sort(np.random.rand(m))[::-1], k)
 
-    W = np.random.rand(m, r)
-    H = np.random.rand(r, n)
+    W = np.random.rand(m, rank)
+    H = np.random.rand(rank, n)
     return (W, H)
 
 
 def update_W(X, W, H, spar):
     """Update the feature matrix based on user-defined sparsity"""
     m, n = np.shape(X)
-    m, r = np.shape(W)
-    cach = np.zeros((m, r))
+    m, rank = np.shape(W)
+    cach = np.zeros((m, rank))
     HHt = np.dot(H, H.T)
     cach = -np.dot(X, H.T) + np.dot(W, np.dot(H, H.T))
-    for i in range(r):
+    for i in range(rank):
         W, cach = W_sparse_ith(W, HHt, cach, spar, i)
-
     return W
 
 
@@ -94,13 +93,12 @@ def update_H(X, W, H):
     WtW = np.dot(W.T, W)
     for j in range(10):
         H = H * WtX / (np.dot(WtW, H) + np.spacing(1))
-
     return H
 
 
 def W_sparse_ith(W, HHt, cach, spar, i):
     """ Update the columns sequentially"""
-    m, r = np.shape(W)
+    m, rank = np.shape(W)
     C = cach[:, i] - W[:, i] * HHt[i, i]
     V = np.zeros(m)
     k = np.sqrt(m) - spar * (np.sqrt(m) - 1)
@@ -138,7 +136,7 @@ def sparse_opt(b, k):
     #print(f'{bot=}, {m=}, {k=}')
     if bot >= m:
         raise ValueError(
-            'Looks like the sparsity measure is not between 0 and 1\m')
+            'Looks like the sparsity measure is not between 0 and 1')
     obj = (-np.sqrt(y) * (np.arange(1, m + 1) + k) + sumb) / np.arange(1, m + 1)
     indx = np.argmax(obj[bot:m])
     p = indx + bot - 1
@@ -148,30 +146,3 @@ def sparse_opt(b, k):
     mue = -sumb[p] / (p + 1) + k / (p + 1) * lam
     z[:p + 1] = (b[:p + 1] + mue) / lam
     return z
-
-
-if __name__ == '__main__':
-    r = 25
-    spar = 0.5
-    maxiter = 200
-    X = scipy.io.loadmat('../data/orlfaces.mat')
-    W = sparse_nmf(X['V'], r, maxiter, spar)
-    for i in range(r):
-        plt.subplot(np.sqrt(r), np.sqrt(r), i + 1)
-        plt.imshow(np.reshape(W.T[i], [92, 112]).T)
-        plt.axis('off')
-        plt.ion()
-
-    plt.show(True)
-    #import ipdb
-    #ipdb.set_trace()
-    
-spar = 0.01
-step = 0.000001
-while spar > 0.001:
-    try:
-        H, W = sparse_nmf(mat.T, 8, maxiter=1, spar=spar)
-    except Exception as e:
-        print(f"Crash at spar={spar}")
-        break
-    spar -= step

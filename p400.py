@@ -22,11 +22,13 @@ with Timer('QC single-cell data and pseudobulk'):
         .qc(cell_type_confidence_column='cell.type.prob',
             doublet_confidence_column='doublet.score',
             custom_filter=pl.col.projid.is_not_null())\
-        .with_columns_obs(projid=pl.col.projid.cast(pl.String))\
+        .with_columns_obs(
+            subset=pl.col.subset.replace({'CUX2+': 'Excitatory'}),
+            projid=pl.col.projid.cast(pl.String))\
         .pseudobulk(ID_column='projid', 
                     cell_type_column='subset',
                     additional_obs=rosmap_pheno)
-    #pb.save('data/pseudobulk/p400')
+    pb.save('data/pseudobulk/p400')
 
 with Timer('QC pseudobulk data'):
     pb = Pseudobulk('data/pseudobulk/p400')
@@ -39,7 +41,7 @@ with Timer('QC pseudobulk data'):
         .qc(case_control_column='pmAD', 
             max_standard_deviations=2, 
             custom_filter=pl.col.pmAD.is_not_null())
-    #pb.save('data/pseudobulk/p400_qcd')
+    pb.save('data/pseudobulk/p400_qcd')
         
 with Timer('Differential expression'):
     pb = Pseudobulk('data/pseudobulk/p400_qcd')
@@ -48,7 +50,7 @@ with Timer('Differential expression'):
             covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
             include_library_size_as_covariate=True,
             voom_plot_directory='figures/DE/voom/p400')
-    #de.write_csv('results/DE/p400_broad.csv')     
+    de.write_csv('results/DE/p400_broad.csv')     
 
 print(Pseudobulk.get_num_DE_hits(de, threshold=0.1).sort('cell_type'))
 print_df(Pseudobulk.get_DE_hits(de, threshold=1, num_top_hits=20)\
@@ -68,8 +70,6 @@ shape: (7, 2)
 '''
 ################################################################################
 
-#TODO: Add stopping criterion for sNMF
-
 import os, optuna, pickle
 import polars as pl, pandas as pd, numpy as np
 import seaborn as sns
@@ -77,14 +77,18 @@ import matplotlib.pylab as plt
 
 os.chdir('projects/def-wainberg/karbabi/single-cell-nmf')
 from sparseNMF import sparse_nmf
+from nimfa.methods.seeding.nndsvd import Nndsvd
 from utils import Pseudobulk, debug, savefig
 from ryp import r, to_r    
 from project_utils import normalize_matrix
 
-debug(third_party=True)
+#debug(third_party=True)
 
-def cross_validate(A, r_max, spar, reps, n, verbose=False):
+def cross_validate(A, rank_max, spar, reps, n, verbose=False):
     res = []
+    inits = {rank: Nndsvd().initialize(A, rank=rank, options=dict(flag=0))
+        for rank in range(1, rank_max + 1)}
+    
     for rep in range(1, reps + 1):
         np.random.seed(rep)
         mask = np.zeros(A.shape, dtype=bool)
@@ -94,20 +98,22 @@ def cross_validate(A, r_max, spar, reps, n, verbose=False):
         A_masked = A.copy()
         A_masked.flat[zero_indices] = 0
 
-        for r in range(1, r_max + 1):
-            W, H = sparse_nmf(A_masked, r, maxiter=30, spar=spar, seed=rep)
+        for rank in range(1, rank_max + 1):
+            W, H = inits[rank]
+            W, H = sparse_nmf(A_masked, rank, maxiter=50, spar=spar, 
+                               W=np.asarray(W), H=np.asarray(H))
             A_r = W @ H
             MSE = np.mean((A[mask] - A_r[mask]) ** 2)
             if verbose:      
-                print(f'rep {rep}, rank: {r}, MSE: {MSE}')
-            res.append((rep, r, MSE))
+                print(f'rep {rep}, rank: {rank}, MSE: {MSE}')
+            res.append((rep, rank, MSE))
             
-    MSE = pd.DataFrame(res, columns=['rep', 'r', 'MSE'])\
-        .astype({'r': int, 'rep': int})\
-        .set_index(['r', 'rep']).squeeze()
+    MSE = pd.DataFrame(res, columns=['rep', 'rank', 'MSE'])\
+        .astype({'rank': int, 'rep': int})\
+        .set_index(['rank', 'rep']).squeeze()
     return(MSE)    
 
-def objective(trial, MSE_trial, r_1se_trial, A, r_max,
+def objective(trial, MSE_trial, r_1se_trial, A, rank_max,
               reps=3, n=0.05, verbose=False):
     
     from scipy.stats import sem 
@@ -116,35 +122,34 @@ def objective(trial, MSE_trial, r_1se_trial, A, r_max,
     spar_u = (np.sqrt(m) + np.sqrt(m - 1)) / (np.sqrt(m) - 1) - 1e-10
     spar = trial.suggest_float('spar', spar_l, spar_u, log=True)
     
-    MSE = cross_validate(A, r_max, spar, reps, n, verbose)
-    mean_MSE = MSE.groupby('r').mean()
+    MSE = cross_validate(A, rank_max, spar, reps, n, verbose)
+    mean_MSE = MSE.groupby('rank').mean()
     r_best = int(mean_MSE.idxmin())
-    r_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[r_best] + \
+    rank_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[r_best] + \
         sem(MSE[r_best])][0])
     
     MSE_trial[spar] = MSE
-    r_1se_trial[spar] = r_1se
-    print(f'{r_1se=}')
-    error = mean_MSE[r_1se]
+    r_1se_trial[spar] = rank_1se
+    print(f'{rank_1se=}')
+    error = mean_MSE[rank_1se]
     return(error)
 
 ################################################################################
 
+save_name = '_fdr05'
+
 de = pl.read_csv('results/DE/p400_broad.csv')
 pb = Pseudobulk('data/pseudobulk/p400_qcd')\
-    .drop(Pseudobulk
-          .get_num_DE_hits(de, threshold=0.05)
-          .filter(pl.col.num_hits <= 100)['cell_type'])\
     .filter_obs(pmAD=1)
 shared_ids = sorted(list(set.intersection(*[set(obs['ID'].to_list())
                         for _, (_, obs, _) in pb.items()])))
 lcpm = pb.filter_obs(pl.col.ID.is_in(shared_ids)).log_CPM(prior_count=2)
-    
+
 cell_types = list(lcpm.keys())
 matrices, cell_types, genes = [], [], []
 for cell_type, (X, obs, var) in lcpm.items():
     gene_mask = var['_index'].is_in(
-        de.filter((pl.col.cell_type == cell_type) & (pl.col.FDR < 0.1))['gene']) 
+        de.filter((pl.col.cell_type == cell_type) & (pl.col.FDR < 0.05))['gene']) 
     matrices.append(normalize_matrix(X.T[gene_mask], 'rint'))    
     gene_select = var['_index'].filter(gene_mask).to_list()    
     genes.extend(gene_select)    
@@ -158,72 +163,71 @@ study = optuna.create_study(
     sampler=optuna.samplers.TPESampler(seed=0, multivariate=True),
     direction='minimize')
 study.optimize(lambda trial: objective(
-    trial, MSE_trial, r_1se_trial, A, r_max=30, reps=3, n=0.05, verbose=True), 
+    trial, MSE_trial, r_1se_trial, A, rank_max=30, verbose=True), 
     n_trials=50)
 
-# with open('results/NMF/MSE/p400/trial.pkl', 'wb') as file:
+# with open(f'results/NMF/trial/p400_trial{save_name}', 'wb') as file:
 #     pickle.dump((study, MSE_trial, r_1se_trial), file)
-# with open('results/NMF/MSE/p400/trial.pkl', 'rb') as file:
-#     study, MSE_trial, r_1se_trial = pickle.load(file)
+with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'rb') as file:
+    study, MSE_trial, r_1se_trial = pickle.load(file)
 
 spar_select = study.best_trial.params.get('spar', 0)
-r_select = r_1se_trial[spar_select]
+rank_select = r_1se_trial[spar_select]
 
-W, H = sparse_nmf(A, r_select, maxiter=300, spar=spar_select)
+W, H = Nndsvd().initialize(A, rank=rank_select, options=dict(flag=0))
+W, H = sparse_nmf(A, rank=rank_select, maxiter=500, spar=spar_select,
+                  W=np.asarray(W), H=np.asarray(H))
 A_r = W @ H
 
-os.makedirs(f'results/NMF/factors/p400', exist_ok=True)    
 W = pl.DataFrame(W)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(genes).alias('gene'))
-W.write_csv(f'results/NMF/factors/p400/Combined_W.tsv',
-                separator='\t')
+W.write_csv(f'results/NMF/factors/p400_W{save_name}.tsv', separator='\t')
 H = pl.DataFrame(H.T)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(shared_ids).alias('ID'))
-H.write_csv(f'results/NMF/factors/p400/Combined_H.tsv', 
-                separator='\t')
-A_r = pl.DataFrame(A_r)\
-    .insert_column(0, pl.Series(genes).alias('gene'))
-A_r.columns = ['gene'] + shared_ids
-A_r.write_csv(f'results/NMF/factors/p400/Combined_A_r.tsv', 
-        separator='\t')
+H.write_csv(f'results/NMF/factors/p400_H{save_name}.tsv', separator='\t')
+
+pl.DataFrame(A, shared_ids)\
+    .insert_column(0, pl.Series(genes).alias('gene'))\
+    .write_csv(f'results/NMF/A/p400_A{save_name}.tsv', separator='\t')
+pl.DataFrame(A_r, shared_ids)\
+    .insert_column(0, pl.Series(genes).alias('gene'))\
+    .write_csv(f'results/NMF/A/p400_Ar{save_name}.tsv', separator='\t')
 
 fig, ax = plt.subplots(figsize=(8, 7)) 
 MSE_values = []
 spar_min = min([spar for spar in MSE_trial.keys()])
 for (current_spar), MSE in MSE_trial.items():
-    mean_MSE = MSE.groupby('r').mean()
+    mean_MSE = MSE.groupby('rank').mean()
     MSE_values.extend(mean_MSE.values) 
-    r_1se = r_1se_trial[current_spar]
+    rank_1se = r_1se_trial[current_spar]
     ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=0.1)
-    ax.scatter(r_1se, mean_MSE[r_1se], color='black', s=16, alpha=0.1)
+    ax.scatter(rank_1se, mean_MSE[rank_1se], color='black', s=16, alpha=0.1)
 MSE_select = MSE_trial[spar_select]
-mean_MSE = MSE_select.groupby('r').mean()
-r_select = r_1se_trial[spar_select]
+mean_MSE = MSE_select.groupby('rank').mean()
+rank_select = r_1se_trial[spar_select]
 lower, upper = np.quantile(MSE_values, [0, 0.9])
 ax.set_ylim(bottom=lower-0.05, top=upper)
 ax.plot(mean_MSE.index, mean_MSE.values, linewidth = 3, color='red')
-ax.scatter(r_select, mean_MSE[r_select], color='red', s=80)
+ax.scatter(rank_select, mean_MSE[rank_select], color='red', s=80)
 #ax.set_xticks(ticks=mean_MSE.index)
 ax.set_yscale('log')
 ax.set_title(rf'$\mathbf{{All\ cell\ types}}$'
             + "\nMSE across Optuna trials\n"
-            + f"Best rank: {r_select}, "
+            + f"Best rank: {rank_select}, "
             + f"Best spar: {spar_select:.2g}, Min spar: {spar_min:.2g}")
 ax.set_xlabel('Rank', fontsize=12, fontweight='bold')
 ax.set_ylabel('Mean MSE', fontsize=12, fontweight='bold')
 fig.subplots_adjust(bottom=0.1, top=0.9, hspace=0.3, wspace=0.25)
-savefig(f"figures/NMF/MSE/p400/MSE_combined_rint.png", dpi=300)
+savefig(f"figures/NMF/MSE/p400_MSE{save_name}.png", dpi=300)
 
 to_r(np.array(cell_types), 'cell_types')
 to_r(A, 'A', format='matrix', rownames=genes)
-to_r(A_r.select(pl.exclude('gene')), 'A_r',
-        format='matrix', rownames=genes)
-to_r(W.select(pl.exclude('gene')), "W", 
-        format='data.frame', rownames=W['gene'])
-to_r(H.select(pl.exclude('ID')), "H",
-        format='data.frame', rownames=H['ID'].cast(str))
+to_r(A_r, 'A_r', format='matrix', rownames=genes)
+to_r(W.drop('gene'), "W", rownames=W['gene'])
+to_r(H.drop('ID'), "H", rownames=shared_ids)
+to_r(save_name, 'save_name')
 
 r('''
 suppressPackageStartupMessages({
@@ -233,13 +237,13 @@ suppressPackageStartupMessages({
         library(scico)
         library(ggsci)
     })
-    mat = A_r
-    row_order = get_order(seriate(dist(W), method = "OLO"))
-    col_order = get_order(seriate(dist(H), method = "OLO"))
+    mat = A
+    row_order = get_order(seriate(dist(A), method = "OLO"))
+    col_order = get_order(seriate(dist(t(A)), method = "OLO"))
     
     create_color_list = function(data, palette) {
-        cols = scico(ncol(data), palette = palette)
-        col_funs = mapply(function(col, max_val) {
+      cols = scico(n+1, palette = palette)[1:n]
+      col_funs = mapply(function(col, max_val) {
             colorRamp2(c(0, max_val), c("white", col))
         }, cols, apply(data, 2, max), SIMPLIFY = FALSE)
         setNames(col_funs, colnames(data))
@@ -295,7 +299,7 @@ suppressPackageStartupMessages({
         show_heatmap_legend = TRUE,
         use_raster = FALSE
     )
-    file_name = "figures/NMF/A/p400/Combined_r_rint.png"
+    file_name = paste0("figures/NMF/A/p400_A", save_name, ".png"
     png(file = file_name, width=7, height=7, units="in", res=1200)
     draw(h)
     dev.off()
@@ -303,43 +307,112 @@ suppressPackageStartupMessages({
 
 ################################################################################
 
-from sklearn.metrics.pairwise import cosine_similarity
+meta = lcpm.obs['Astrocytes']
+meta.write_csv('data/pseudobulk/p400_qcd/person_metadata.tsv', separator='\t')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def norm(X, p="fro"):
+    assert 1 in X.shape or p != 2, "Computing entry-wise norms only."
+    return np.linalg.norm(np.mat(X), p)
+
+def random_c(V, rank, options, seed=0):
+    from operator import itemgetter
+    rank = rank
+    p_c = options.get('p_c', int(np.ceil(1. / 5 * V.shape[1])))
+    p_r = options.get('p_r', int(np.ceil(1. / 5 * V.shape[0])))
+    l_c = options.get('l_c', int(np.ceil(1. / 2 * V.shape[1])))
+    l_r = options.get('l_r', int(np.ceil(1. / 2 * V.shape[0])))
+    
+    prng = np.random.RandomState(seed=seed)
+    W = np.mat(np.zeros((V.shape[0], rank)))
+    H = np.mat(np.zeros((rank, V.shape[1])))
+    top_c = sorted(enumerate([norm(V[:, i], 2)
+                    for i in range(
+                        V.shape[1])]), key=itemgetter(1), reverse=True)[:l_c]
+    top_r = sorted(
+        enumerate([norm(V[i, :], 2) for i in range(V.shape[0])]),
+        key=itemgetter(1), reverse=True)[:l_r]
+    
+    top_c = np.mat(list(zip(*top_c))[0])
+    top_r = np.mat(list(zip(*top_r))[0])
+    for i in range(rank):
+        W[:, i] = V[
+            :, top_c[0, prng.randint(low=0, high=l_c, size=p_c)]\
+                .tolist()[0]].mean(axis=1)
+        H[i, :] = V[
+            top_r[0, prng.randint(low=0, high=l_r, size=p_r)]\
+                .tolist()[0], :].mean(axis=0)
+    return np.array(W), np.array(H)
+
+def random_vcol(V, rank, options, seed=0):
+    rank = rank
+    p_c = options.get('p_c', int(np.ceil(1. / 5 * V.shape[1])))
+    p_r = options.get('p_r', int(np.ceil(1. / 5 * V.shape[0])))
+    prng = np.random.RandomState(seed=seed)
+    W = np.mat(np.zeros((V.shape[0], rank)))
+    H = np.mat(np.zeros((rank, V.shape[1])))
+    for i in range(rank):
+        W[:, i] = V[:, prng.randint(
+            low=0, high=V.shape[1], size=p_c)].mean(axis=1)
+        H[i, :] = V[
+            prng.randint(low=0, high=V.shape[0], size=p_r), :].mean(axis=0)
+    return np.array(W), np.array(H)
 
 n_runs = 100
+corr_list = []
+cluster_agreement  = np.zeros((A.shape[1], A.shape[1]))
 
-for rank in range(2,10): 
-    consensus_matrix = np.zeros((A.shape[1], A.shape[1]))
+for run in range(n_runs):
+    #W, H = random_vcol(np.matrix(A), rank=9, options=dict(), seed=run)
+    #W, H = random_c(np.matrix(A), rank=9, options=dict(), seed=run)
+    W, H = sparse_nmf(A, rank=9, maxiter=50, spar=spar_select, 
+                      seed=run, verbose=True)
+    
+    corr_list.append(np.corrcoef(H, rowvar=False))
+    
+    cluster_membership = np.argmax(H, axis=0)
+    overlap_matrix = (cluster_membership[:, None] == \
+        cluster_membership[None, :]).astype(int)
+    cluster_agreement  += overlap_matrix
+    
+corr_sd_matrix = np.std(corr_list, axis=0)
+cluster_agreement  /= n_runs
 
-    for run in range(n_runs):
-        W, H = sparse_nmf(A, r=rank, maxiter=50, spar=spar_select, 
-                        seed=run, verbose=True)
-        H_run = pd.DataFrame(H.T).set_axis(shared_ids)
-        similarity_matrix = cosine_similarity(H_run)    
-        consensus_matrix += similarity_matrix
-    consensus_matrix /= n_runs
+sns.clustermap(corr_sd_matrix, method='average', cmap='rocket_r',
+               xticklabels=False, yticklabels=False, figsize=(10, 10))
+plt.savefig('corr_sd_matrix3.png')
+sns.clustermap(cluster_agreement , method='average', 
+               xticklabels=False, yticklabels=False, figsize=(10, 10))
+plt.savefig('cluster_agreement3.png')
 
-    sns.clustermap(consensus_matrix, method='average',
-                xticklabels=False, yticklabels=False, figsize=(10, 10))
-    plt.suptitle(f'Consensus Matrix', y = 0.99)
-    plt.savefig(f'figures/NMF/consensus/p400/rint_cosine_{rank=}.png')
 
-    consensus_matrix = np.zeros((A.shape[1], A.shape[1]))
 
-    for run in range(n_runs):
-        W, H = sparse_nmf(A, r=rank, maxiter=50, spar=spar_select, 
-                        seed=run, verbose=True)
-        H_run = pd.DataFrame(H.T).set_axis(shared_ids)
 
-        cluster_membership = np.argmax(H_run.values, axis=1)
-        connectivity_matrix = (cluster_membership[:, None] == \
-            cluster_membership[None, :]).astype(int)
-        consensus_matrix += connectivity_matrix
-    consensus_matrix /= n_runs
 
-    sns.clustermap(consensus_matrix, method='average', 
-                xticklabels=False, yticklabels=False, figsize=(10, 10))
-    plt.suptitle(f'Consensus Matrix', y = 0.99)
-    plt.savefig(f'figures/NMF/consensus/p400/rint_argmax_{rank=}.png')
+
+
+
+
+
 
 
 
@@ -351,7 +424,7 @@ spar_u = (np.sqrt(m) + np.sqrt(m - 1)) / (np.sqrt(m) - 1) - 1e-10
 spar_l
 spar_u
 
-W, H = sparse_nmf(mat, r=5, maxiter=300, spar=0.5)
+W, H = sparse_nmf(mat, rank=5, maxiter=300, spar=0.5)
 W = pl.DataFrame(W)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(genes[0:500]).alias('gene'))

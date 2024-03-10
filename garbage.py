@@ -1,4 +1,12 @@
+from scipy.spatial.distance import pdist
+from scipy.cluster.hierarchy import linkage, leaves_list
 
+row_order = leaves_list(linkage(pdist(W.drop('gene').to_numpy()),
+                               method='complete', optimal_ordering=True))
+col_order = leaves_list(linkage(pdist(H.drop('ID').to_numpy()),
+                                method='complete', optimal_ordering=True))
+to_r(row_order, "row_order")
+to_r(col_order, "col_order")
 
 ################################################################################
 
