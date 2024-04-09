@@ -52,20 +52,19 @@ with Timer('Differential expression'):
             voom_plot_directory='figures/DE/voom/p400')
     de.write_csv('results/DE/p400_broad.csv')     
 
-print(Pseudobulk.get_num_DE_hits(de, threshold=0.1).sort('cell_type'))
+print(Pseudobulk.get_num_DE_hits(de, threshold=0.05).sort('cell_type'))
 print_df(Pseudobulk.get_DE_hits(de, threshold=1, num_top_hits=20)\
          .filter(cell_type='Inhibitory'))
 
 '''
-cell_type         num_hits 
- Astrocytes        568      
- CUX2+             1305     
- Endothelial       2        
- Inhibitory        601      
- Microglia         21       
- OPCs              4        
- Oligodendrocytes  289      
-shape: (7, 2)
+ cell_type         num_hits 
+ Astrocytes        254      
+ Endothelial       1        
+ Excitatory        736      
+ Inhibitory        251      
+ Microglia         8        
+ OPCs              2        
+Oligodendrocytes  134     
  
 '''
 ################################################################################
@@ -158,15 +157,20 @@ for cell_type, (X, obs, var) in lcpm.items():
 A = np.vstack(matrices)
 A = normalize_matrix(A, 'rint')
 
+meta = lcpm.obs['Astrocytes']
+meta.write_csv('results/NMF/A/p400_metadata.tsv', separator='\t')
+pd.DataFrame(cell_types).to_csv('results/NMF/A/p400_celltypes.tsv', 
+                                sep='\t', index=False)
+
 MSE_trial, r_1se_trial = {}, {}
 study = optuna.create_study(
-    sampler=optuna.samplers.TPESampler(seed=0, multivariate=True),
+    sampler=optuna.samplers.TPESampler(multivariate=True),
     direction='minimize')
 study.optimize(lambda trial: objective(
     trial, MSE_trial, r_1se_trial, A, rank_max=30, verbose=True), 
     n_trials=50)
 
-# with open(f'results/NMF/trial/p400_trial{save_name}', 'wb') as file:
+# with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'wb') as file:
 #     pickle.dump((study, MSE_trial, r_1se_trial), file)
 with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'rb') as file:
     study, MSE_trial, r_1se_trial = pickle.load(file)
@@ -238,25 +242,26 @@ suppressPackageStartupMessages({
         library(ggsci)
     })
     mat = A
-    row_order = get_order(seriate(dist(A), method = "OLO"))
-    col_order = get_order(seriate(dist(t(A)), method = "OLO"))
+    row_order = get_order(seriate(dist(A_r), method = "OLO"))
+    col_order = get_order(seriate(dist(t(A_r)), method = "OLO"))
     
     create_color_list = function(data, palette) {
-      cols = scico(n+1, palette = palette)[1:n]
-      col_funs = mapply(function(col, max_val) {
+        n = ncol(data)
+        cols = scico(n+1, palette = palette)[1:n]
+        col_funs = mapply(function(col, max_val) {
             colorRamp2(c(0, max_val), c("white", col))
-        }, cols, apply(data, 2, max), SIMPLIFY = FALSE)
+            }, cols, apply(data, 2, max), SIMPLIFY = FALSE)
         setNames(col_funs, colnames(data))
     }
     col_list_H = create_color_list(H, "batlow")
     col_list_W = create_color_list(W, "batlow")
-    d3_colors = pal_d3()(length(unique(cell_types)))
-    names(d3_colors) = unique(cell_types)
+    colors = pal_frontiers()(length(unique(cell_types)))
+    names(colors) = unique(cell_types)
     
     hr1 = rowAnnotation(
         cell_types = factor(cell_types),
         simple_anno_size = unit(0.3, "cm"),
-        col = list(cell_types = d3_colors),
+        col = list(cell_types = colors),
         name = "cell type",
         show_annotation_name = FALSE,
         show_legend = TRUE,
@@ -299,16 +304,27 @@ suppressPackageStartupMessages({
         show_heatmap_legend = TRUE,
         use_raster = FALSE
     )
-    file_name = paste0("figures/NMF/A/p400_A", save_name, ".png"
+    file_name = paste0("figures/NMF/A/p400_A", save_name, ".png")
     png(file = file_name, width=7, height=7, units="in", res=1200)
     draw(h)
     dev.off()
 ''')
 
 ################################################################################
+from scipy.spatial.distance import pdist
+from scipy.cluster.hierarchy import linkage, leaves_list
 
-meta = lcpm.obs['Astrocytes']
-meta.write_csv('data/pseudobulk/p400_qcd/person_metadata.tsv', separator='\t')
+df = H.to_pandas().set_index('ID')
+df = (df-df.min())/(df.max()-df.min())
+row_order = leaves_list(linkage(pdist(df.to_numpy()),
+                               method='complete', optimal_ordering=True))
+df = df.iloc[row_order]
+
+fig, ax = plt.subplots(figsize=(5,10))    
+sns.heatmap(df, cmap='rocket_r', cbar=False, 
+            xticklabels=True, yticklabels=False, rasterized=True)
+ax.set_ylabel('Samples', fontsize=12, fontweight='bold')
+savefig('tmp.png')
 
 
 

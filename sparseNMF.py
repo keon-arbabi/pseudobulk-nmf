@@ -2,7 +2,8 @@ import numpy as np
 import scipy.io
 import pylab as plt
 
-def sparse_nmf(X, rank, maxiter, spar, seed=None, verbose=False, W = None, H = None):
+def sparse_nmf(X, rank, maxiter, spar_W, spar_H, 
+               seed=None, verbose=False, W = None, H = None):
     """Input data and the rank
 
     Learns a sparse NMF model given data X and the rank rank.
@@ -36,8 +37,9 @@ def sparse_nmf(X, rank, maxiter, spar, seed=None, verbose=False, W = None, H = N
         Obj[i] = np.linalg.norm(X - np.dot(W, H), 'fro')
         if verbose: 
             print('iter: {} Obj: {}'.format(i + 1,  Obj[i]))
-        W = update_W(X, W, H, spar)
-        H = update_H(X, W, H)
+        W = update_W(X, W, H, spar_W)
+        #H = update_H(X, W, H)
+        H = update_W(X.T, H.T, W.T, spar_H).T
     return W, H
 
 
@@ -100,7 +102,7 @@ def W_sparse_ith(W, HHt, cach, spar, i):
     """ Update the columns sequentially"""
     m, rank = np.shape(W)
     C = cach[:, i] - W[:, i] * HHt[i, i]
-    V = np.zeros(m)
+    V = np.zeros(m) 
     k = np.sqrt(m) - spar * (np.sqrt(m) - 1)
     a = sparse_opt(np.sort(-C)[::-1], k)
     ind = np.argsort(-C)[::-1]
