@@ -76,31 +76,32 @@ import matplotlib.pylab as plt
 
 os.chdir('projects/def-wainberg/karbabi/single-cell-nmf')
 from sparseNMF import sparse_nmf
-from nimfa.methods.seeding.nndsvd import Nndsvd
+from sklearn.decomposition._nmf import _initialize_nmf
 from utils import Pseudobulk, debug, savefig
 from ryp import r, to_r    
 from project_utils import normalize_matrix
 
 #debug(third_party=True)
 
-def cross_validate(A, rank_max, spar, reps, n, verbose=False):
+def cross_validate(A, rank_max, spar_W, spar_H, reps, mask_pct, verbose=False):
     res = []
-    inits = {rank: Nndsvd().initialize(A, rank=rank, options=dict(flag=0))
+    inits = {rank: _initialize_nmf(A, n_components=rank, init='nndsvd')
         for rank in range(1, rank_max + 1)}
     
     for rep in range(1, reps + 1):
         np.random.seed(rep)
         mask = np.zeros(A.shape, dtype=bool)
         zero_indices = np.random.choice(
-            A.size, int(round(n * A.size)), replace=False)
+            A.size, int(round(mask_pct * A.size)), replace=False)
         mask.flat[zero_indices] = True
         A_masked = A.copy()
         A_masked.flat[zero_indices] = 0
 
         for rank in range(1, rank_max + 1):
             W, H = inits[rank]
-            W, H = sparse_nmf(A_masked, rank, maxiter=50, spar=spar, 
-                               W=np.asarray(W), H=np.asarray(H))
+            W, H = sparse_nmf(A_masked, rank, maxiter=50, 
+                              spar_W=spar_W, spar_H=spar_H, 
+                              W=np.asarray(W), H=np.asarray(H))
             A_r = W @ H
             MSE = np.mean((A[mask] - A_r[mask]) ** 2)
             if verbose:      
@@ -113,29 +114,32 @@ def cross_validate(A, rank_max, spar, reps, n, verbose=False):
     return(MSE)    
 
 def objective(trial, MSE_trial, r_1se_trial, A, rank_max,
-              reps=3, n=0.05, verbose=False):
+              reps=3, mask_pct=0.05, verbose=False):
     
     from scipy.stats import sem 
-    m = A.shape[0]
-    spar_l = (np.sqrt(m) - np.sqrt(m - 1)) / (np.sqrt(m) - 1) + 1e-10
-    spar_u = (np.sqrt(m) + np.sqrt(m - 1)) / (np.sqrt(m) - 1) - 1e-10
-    spar = trial.suggest_float('spar', spar_l, spar_u, log=True)
-    
-    MSE = cross_validate(A, rank_max, spar, reps, n, verbose)
+    m, n = A.shape
+    spar_W_l = (np.sqrt(m) - np.sqrt(m - 1)) / (np.sqrt(m) - 1) + 1e-10
+    spar_W_u = (np.sqrt(m) + np.sqrt(m - 1)) / (np.sqrt(m) - 1) - 1e-10
+    spar_H_l = (np.sqrt(n) - np.sqrt(n - 1)) / (np.sqrt(n) - 1) + 1e-10
+    spar_H_u = (np.sqrt(n) + np.sqrt(n - 1)) / (np.sqrt(n) - 1) - 1e-10
+    spar_W = trial.suggest_float('spar_W', spar_W_l, spar_W_u, log=True)
+    spar_H = trial.suggest_float('spar_H', spar_H_l, spar_H_u, log=True)
+
+    MSE = cross_validate(A, rank_max, spar_W, spar_H, reps, mask_pct, verbose)
     mean_MSE = MSE.groupby('rank').mean()
     r_best = int(mean_MSE.idxmin())
     rank_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[r_best] + \
         sem(MSE[r_best])][0])
     
-    MSE_trial[spar] = MSE
-    r_1se_trial[spar] = rank_1se
+    MSE_trial[spar_W, spar_H] = MSE
+    r_1se_trial[spar_W, spar_H] = rank_1se
     print(f'{rank_1se=}')
     error = mean_MSE[rank_1se]
     return(error)
 
 ################################################################################
 
-save_name = '_fdr05'
+save_name = '_fdr05_bisparse'
 
 de = pl.read_csv('results/DE/p400_broad.csv')
 pb = Pseudobulk('data/pseudobulk/p400_qcd')\
@@ -168,18 +172,20 @@ study = optuna.create_study(
     direction='minimize')
 study.optimize(lambda trial: objective(
     trial, MSE_trial, r_1se_trial, A, rank_max=30, verbose=True), 
-    n_trials=50)
+    n_trials=2)
 
 # with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'wb') as file:
 #     pickle.dump((study, MSE_trial, r_1se_trial), file)
-with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'rb') as file:
-    study, MSE_trial, r_1se_trial = pickle.load(file)
+# with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'rb') as file:
+#     study, MSE_trial, r_1se_trial = pickle.load(file)
 
-spar_select = study.best_trial.params.get('spar', 0)
-rank_select = r_1se_trial[spar_select]
+spar_W_select = study.best_trial.params.get('spar_W')
+spar_H_select = study.best_trial.params.get('spar_H')
+rank_select = r_1se_trial[spar_W_select, spar_H_select]
 
-W, H = Nndsvd().initialize(A, rank=rank_select, options=dict(flag=0))
-W, H = sparse_nmf(A, rank=rank_select, maxiter=500, spar=spar_select,
+W, H = _initialize_nmf(A, n_components=rank_select, init='nndsvd')
+W, H = sparse_nmf(A, rank=rank_select, maxiter=500, 
+                  spar_W=spar_W_select, spar_H=spar_H_select, 
                   W=np.asarray(W), H=np.asarray(H))
 A_r = W @ H
 
@@ -201,16 +207,16 @@ pl.DataFrame(A_r, shared_ids)\
 
 fig, ax = plt.subplots(figsize=(8, 7)) 
 MSE_values = []
-spar_min = min([spar for spar in MSE_trial.keys()])
+spar_W_min, spar_H_min = min([spar for spar in MSE_trial.keys()])
 for (current_spar), MSE in MSE_trial.items():
     mean_MSE = MSE.groupby('rank').mean()
     MSE_values.extend(mean_MSE.values) 
     rank_1se = r_1se_trial[current_spar]
     ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=0.1)
     ax.scatter(rank_1se, mean_MSE[rank_1se], color='black', s=16, alpha=0.1)
-MSE_select = MSE_trial[spar_select]
+MSE_select = MSE_trial[spar_W_select, spar_H_select]
 mean_MSE = MSE_select.groupby('rank').mean()
-rank_select = r_1se_trial[spar_select]
+rank_select = r_1se_trial[spar_W_select, spar_H_select]
 lower, upper = np.quantile(MSE_values, [0, 0.9])
 ax.set_ylim(bottom=lower-0.05, top=upper)
 ax.plot(mean_MSE.index, mean_MSE.values, linewidth = 3, color='red')
@@ -219,8 +225,9 @@ ax.scatter(rank_select, mean_MSE[rank_select], color='red', s=80)
 ax.set_yscale('log')
 ax.set_title(rf'$\mathbf{{All\ cell\ types}}$'
             + "\nMSE across Optuna trials\n"
-            + f"Best rank: {rank_select}, "
-            + f"Best spar: {spar_select:.2g}, Min spar: {spar_min:.2g}")
+            + f"\nBest rank: {rank_select},\n"
+            + f"\nBest spar_W: {spar_W_select:.2g}, Min spar_W: {spar_W_min:.2g},\n"
+            + f"\nBest spar_H: {spar_H_select:.2g}, Min spar_H: {spar_H_min:.2g}\n")
 ax.set_xlabel('Rank', fontsize=12, fontweight='bold')
 ax.set_ylabel('Mean MSE', fontsize=12, fontweight='bold')
 fig.subplots_adjust(bottom=0.1, top=0.9, hspace=0.3, wspace=0.25)
@@ -241,9 +248,9 @@ suppressPackageStartupMessages({
         library(scico)
         library(ggsci)
     })
-    mat = A
-    row_order = get_order(seriate(dist(A_r), method = "OLO"))
-    col_order = get_order(seriate(dist(t(A_r)), method = "OLO"))
+    mat = A_r
+    row_order = get_order(seriate(dist(mat), method = "OLO"))
+    col_order = get_order(seriate(dist(t(mat)), method = "OLO"))
     
     create_color_list = function(data, palette) {
         n = ncol(data)
@@ -304,7 +311,7 @@ suppressPackageStartupMessages({
         show_heatmap_legend = TRUE,
         use_raster = FALSE
     )
-    file_name = paste0("figures/NMF/A/p400_A", save_name, ".png")
+    file_name = paste0("figures/NMF/A/p400_Ar", save_name, ".png")
     png(file = file_name, width=7, height=7, units="in", res=1200)
     draw(h)
     dev.off()

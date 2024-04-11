@@ -38,6 +38,7 @@ def sparse_nmf(X, rank, maxiter, spar_W, spar_H,
         if verbose: 
             print('iter: {} Obj: {}'.format(i + 1,  Obj[i]))
         W = update_W(X, W, H, spar_W)
+        #W = update_H(X.T, H.T, W.T).T
         #H = update_H(X, W, H)
         H = update_W(X.T, H.T, W.T, spar_H).T
     return W, H
