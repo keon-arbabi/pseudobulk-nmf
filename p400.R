@@ -149,7 +149,7 @@ W %>%
   scale_color_frontiers()+ 
   labs(x = "Cell Type", color = "Cell Type") + 
   coord_flip() +
-  theme_classic() +
+  theme_classic() + 
   theme(legend.position = "None") 
 ggsave(file="cell_type_enrich.png", width = 5, height = 6, units = "in")
 

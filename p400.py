@@ -5,7 +5,9 @@ os.chdir('projects/def-wainberg/karbabi/single-cell-nmf')
 from utils import Timer, print_df, get_coding_genes, debug, \
     SingleCell, Pseudobulk
 
-debug(third_party=True)
+# debug(third_party=True)
+
+# Columbia p400 ################################################################
 
 with Timer('Load single-cell data'):
     sc = SingleCell('data/single-cell/p400/p400_qced_shareable.h5ad')
@@ -56,17 +58,64 @@ print(Pseudobulk.get_num_DE_hits(de, threshold=0.05).sort('cell_type'))
 print_df(Pseudobulk.get_DE_hits(de, threshold=1, num_top_hits=20)\
          .filter(cell_type='Inhibitory'))
 
-'''
- cell_type         num_hits 
- Astrocytes        254      
- Endothelial       1        
- Excitatory        736      
- Inhibitory        251      
- Microglia         8        
- OPCs              2        
-Oligodendrocytes  134     
- 
-'''
+
+# MIT p400 #####################################################################
+
+with Timer('Load single-cell data'):
+    import gc
+    from scipy.sparse import vstack
+    cell_types = ['Excitatory_neurons_set1', 'Excitatory_neurons_set2', 
+                  'Excitatory_neurons_set3', 'Inhibitory_neurons',
+                  'Oligodendrocytes', 'OPCs', 'Astrocytes',
+                  'Immune_cells', 'Vasculature_cells'] 
+    sc_per_cell_type = {cell_type: SingleCell(
+        f'data/single-cell/Mathys/processed/{cell_type}.rds')
+                        for cell_type in cell_types}
+    gc.collect()
+    
+    print('Merging...')
+    X = vstack([sc_per_cell_type[cell_type].X 
+                for cell_type in cell_types])
+    obs = pl.concat([sc_per_cell_type[cell_type].obs 
+                     for cell_type in cell_types])
+    var = sc_per_cell_type[cell_types[0]].var
+    assert all(var.equals(sc_per_cell_type[cell_type].var)
+               for cell_type in cell_types[1:])
+    sc = SingleCell(X=X, obs=obs, var=var)
+    
+    
+    
+sc_full = SingleCell('data/single-cell/Mathys/PFC427_raw_data.h5ad')
+
+sc = SingleCell('data/single-cell/Mathys/processed/Immune_cells.rds')
+sc.obs['cell'][0]
+sc['AACTTTCAGGATGGTC-1-0']
+sc[0]
+
+sc_full['SM_Last16_AAACCCATCCGTAGTA-1']
+sc_full[1]
+
+with Timer('Find doublets'):
+    import scrublet as scr
+    scrub = scr.Scrublet(sc.X, expected_doublet_rate=0.045)
+    sc.obs['doublet_scores'], sc.obs['predicted_doublets'] = \
+        scrub.scrub_doublets(n_prin_comps=20)
+
+rosmap_pheno = \
+    pl.read_csv(
+        'data/single-cell/p400/dataset_978_basic_04-21-2023_with_pmAD.csv',
+        dtypes={'projid': pl.String})\
+    .unique(subset='projid')
+    
+    
+#    .drop([col for col in sc.obs.columns if col != 'projid'])
+
+
+
+
+
+
+
 ################################################################################
 
 import os, optuna, pickle
@@ -75,127 +124,147 @@ import seaborn as sns
 import matplotlib.pylab as plt
 
 os.chdir('projects/def-wainberg/karbabi/single-cell-nmf')
-from sparseNMF import sparse_nmf
-from sklearn.decomposition._nmf import _initialize_nmf
 from utils import Pseudobulk, debug, savefig
+from sklearn.decomposition._nmf import _initialize_nmf
+from sparseNMF import sparse_nmf
 from ryp import r, to_r    
-from project_utils import normalize_matrix
 
 #debug(third_party=True)
 
-def cross_validate(A, rank_max, spar_W, spar_H, reps, mask_pct, verbose=False):
+def sparseness_hoyer(x):
+    """
+    The sparseness of array x is a real number in [0, 1], where sparser array
+    has value closer to 1. Sparseness is 1 iff the vector contains a single
+    nonzero component and is equal to 0 iff all components of the vector are 
+    the same
+        
+    modified from Hoyer 2004: [sqrt(n)-L1/L2]/[sqrt(n)-1]
+    adapted from nimfa package: https://nimfa.biolab.si/
+    """
+    from math import sqrt 
+    eps = np.finfo(x.dtype).eps if 'int' not in str(x.dtype) else 1e-9
+    n = x.size
+    if np.min(x) < 0:
+        x -= np.min(x)
+    if np.allclose(x, np.zeros(x.shape), atol=1e-6):
+        return 0.0
+    L1 = abs(x).sum()
+    L2 = sqrt(np.multiply(x, x).sum())
+    sparseness_num = sqrt(n) - (L1 + eps) / (L2 + eps)
+    sparseness_den = sqrt(n) - 1
+    return sparseness_num / sparseness_den  
+
+# rank_max=10
+# spar=0.2
+# reps=3
+# n=0.05
+# verbose=True
+
+def cross_validate(A, rank_max, spar, reps, n, verbose=False):
     res = []
-    inits = {rank: _initialize_nmf(A, n_components=rank, init='nndsvd')
-        for rank in range(1, rank_max + 1)}
-    
     for rep in range(1, reps + 1):
         np.random.seed(rep)
         mask = np.zeros(A.shape, dtype=bool)
         zero_indices = np.random.choice(
-            A.size, int(round(mask_pct * A.size)), replace=False)
+            A.size, int(round(n * A.size)), replace=False)
         mask.flat[zero_indices] = True
         A_masked = A.copy()
         A_masked.flat[zero_indices] = 0
 
         for rank in range(1, rank_max + 1):
-            W, H = inits[rank]
-            W, H = sparse_nmf(A_masked, rank, maxiter=50, 
-                              spar_W=spar_W, spar_H=spar_H, 
-                              W=np.asarray(W), H=np.asarray(H))
+            W, H = _initialize_nmf(A_masked, rank, init='nndsvd')
+            W, H = sparse_nmf(A_masked, rank=rank, spar=spar, W=W, H=H,
+                              tol=1e-4, maxiter=np.iinfo('int32').max,
+                              verbose=False)
             A_r = W @ H
             MSE = np.mean((A[mask] - A_r[mask]) ** 2)
+            sparseness = sparseness_hoyer(H)
             if verbose:      
-                print(f'rep {rep}, rank: {rank}, MSE: {MSE}')
-            res.append((rep, rank, MSE))
+                print(f'{rep=}, {rank=}, {MSE=:0.4f}, {sparseness=:0.4f}')
+            res.append((rep, rank, MSE, sparseness))
             
-    MSE = pd.DataFrame(res, columns=['rep', 'rank', 'MSE'])\
-        .astype({'rank': int, 'rep': int})\
-        .set_index(['rank', 'rep']).squeeze()
-    return(MSE)    
+    results = pd.DataFrame(
+        res, columns=['rep', 'rank', 'MSE', 'sparseness'])\
+        .set_index(['rank', 'rep'])   
+    return results
 
-def objective(trial, MSE_trial, r_1se_trial, A, rank_max,
-              reps=3, mask_pct=0.05, verbose=False):
+def objective(trial, MSE_trial, rank_1se_trial, A, rank_max,
+              reps=3, n=0.05, verbose=False):
     
     from scipy.stats import sem 
-    m, n = A.shape
-    spar_W_l = (np.sqrt(m) - np.sqrt(m - 1)) / (np.sqrt(m) - 1) + 1e-10
-    spar_W_u = (np.sqrt(m) + np.sqrt(m - 1)) / (np.sqrt(m) - 1) - 1e-10
-    spar_H_l = (np.sqrt(n) - np.sqrt(n - 1)) / (np.sqrt(n) - 1) + 1e-10
-    spar_H_u = (np.sqrt(n) + np.sqrt(n - 1)) / (np.sqrt(n) - 1) - 1e-10
-    spar_W = trial.suggest_float('spar_W', spar_W_l, spar_W_u, log=True)
-    spar_H = trial.suggest_float('spar_H', spar_H_l, spar_H_u, log=True)
-
-    MSE = cross_validate(A, rank_max, spar_W, spar_H, reps, mask_pct, verbose)
-    mean_MSE = MSE.groupby('rank').mean()
-    r_best = int(mean_MSE.idxmin())
-    rank_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[r_best] + \
-        sem(MSE[r_best])][0])
+    m = A.shape[0]
+    spar_l = (np.sqrt(m) - np.sqrt(m - 1)) / (np.sqrt(m) - 1) + 1e-10
+    spar_u = (np.sqrt(m) + np.sqrt(m - 1)) / (np.sqrt(m) - 1) - 1e-10
+    spar = trial.suggest_float('spar', spar_l, spar_u, log=True)
     
-    MSE_trial[spar_W, spar_H] = MSE
-    r_1se_trial[spar_W, spar_H] = rank_1se
+    results = cross_validate(A, rank_max, spar, reps, n, verbose)    
+    mean_MSE = results.groupby('rank').mean()['MSE']
+    rank_best = int(mean_MSE.idxmin())
+    rank_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[rank_best] + \
+        sem(results.loc[rank_best, 'MSE'])][0])
+    
+    # mean_sparseness = results.groupby('rank').mean()['sparseness']
+    # sparseness = mean_sparseness[rank_1se]
+    
+    MSE_trial[spar] = mean_MSE
+    rank_1se_trial[spar] = rank_1se
     print(f'{rank_1se=}')
-    error = mean_MSE[rank_1se]
-    return(error)
+    MSE = mean_MSE[rank_1se]
+    return MSE
 
 ################################################################################
 
-save_name = '_fdr05_bisparse'
+save_name = '_fdr05_cpm_norm'
 
 de = pl.read_csv('results/DE/p400_broad.csv')
-pb = Pseudobulk('data/pseudobulk/p400_qcd')\
-    .filter_obs(pmAD=1)
-shared_ids = sorted(list(set.intersection(*[set(obs['ID'].to_list())
-                        for _, (_, obs, _) in pb.items()])))
-lcpm = pb.filter_obs(pl.col.ID.is_in(shared_ids)).log_CPM(prior_count=2)
+pb = Pseudobulk('data/pseudobulk/p400_qcd').filter_obs(pmAD=1)
+shared_ids = sorted(set.intersection(*(set(obs['ID'])
+                                       for obs in pb.iter_obs())))
+cpm = pb.filter_obs(pl.col.ID.is_in(shared_ids)).CPM()
 
-cell_types = list(lcpm.keys())
+cell_types = list(cpm.keys())
 matrices, cell_types, genes = [], [], []
-for cell_type, (X, obs, var) in lcpm.items():
+for cell_type, (X, obs, var) in cpm.items():
     gene_mask = var['_index'].is_in(
-        de.filter((pl.col.cell_type == cell_type) & (pl.col.FDR < 0.05))['gene']) 
-    matrices.append(normalize_matrix(X.T[gene_mask], 'rint'))    
+        de.filter((pl.col.cell_type == cell_type) & \
+            (pl.col.FDR < 0.05))['gene']) 
+    matrices.append(X.T[gene_mask]) 
     gene_select = var['_index'].filter(gene_mask).to_list()    
     genes.extend(gene_select)    
     cell_types.extend([cell_type] * len(gene_select))
-    
+
 A = np.vstack(matrices)
-A = normalize_matrix(A, 'rint')
+A = A / np.mean(A, axis=1)[:, None]
 
-meta = lcpm.obs['Astrocytes']
-meta.write_csv('results/NMF/A/p400_metadata.tsv', separator='\t')
-pd.DataFrame(cell_types).to_csv('results/NMF/A/p400_celltypes.tsv', 
-                                sep='\t', index=False)
-
-MSE_trial, r_1se_trial = {}, {}
+MSE_trial, rank_1se_trial = {}, {}
 study = optuna.create_study(
     sampler=optuna.samplers.TPESampler(multivariate=True),
     direction='minimize')
 study.optimize(lambda trial: objective(
-    trial, MSE_trial, r_1se_trial, A, rank_max=30, verbose=True), 
-    n_trials=2)
+    trial, MSE_trial, rank_1se_trial, A, rank_max=15, verbose=True), 
+    n_trials=20)
 
-# with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'wb') as file:
-#     pickle.dump((study, MSE_trial, r_1se_trial), file)
-# with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'rb') as file:
-#     study, MSE_trial, r_1se_trial = pickle.load(file)
+with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'wb') as file:
+    pickle.dump((study, MSE_trial, rank_1se_trial), file)
+with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'rb') as file:
+    study, MSE_trial, rank_1se_trial = pickle.load(file)
 
-spar_W_select = study.best_trial.params.get('spar_W')
-spar_H_select = study.best_trial.params.get('spar_H')
-rank_select = r_1se_trial[spar_W_select, spar_H_select]
+spar_select = study.best_trial.params.get('spar')
+rank_select = rank_1se_trial[spar_select]
 
 W, H = _initialize_nmf(A, n_components=rank_select, init='nndsvd')
-W, H = sparse_nmf(A, rank=rank_select, maxiter=500, 
-                  spar_W=spar_W_select, spar_H=spar_H_select, 
-                  W=np.asarray(W), H=np.asarray(H))
+W, H = sparse_nmf(A, rank=rank_select, spar=spar_select, W=W, H=H,
+                  tol=1e-6, maxiter=np.iinfo('int32').max,
+                  verbose=True)
 A_r = W @ H
 
 W = pl.DataFrame(W)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(genes).alias('gene'))
-W.write_csv(f'results/NMF/factors/p400_W{save_name}.tsv', separator='\t')
 H = pl.DataFrame(H.T)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(shared_ids).alias('ID'))
+W.write_csv(f'results/NMF/factors/p400_W{save_name}.tsv', separator='\t')
 H.write_csv(f'results/NMF/factors/p400_H{save_name}.tsv', separator='\t')
 
 pl.DataFrame(A, shared_ids)\
@@ -205,37 +274,59 @@ pl.DataFrame(A_r, shared_ids)\
     .insert_column(0, pl.Series(genes).alias('gene'))\
     .write_csv(f'results/NMF/A/p400_Ar{save_name}.tsv', separator='\t')
 
+
+pb = Pseudobulk('data/pseudobulk/p400_qcd')\
+    .filter_obs(pl.col.ID.is_in(shared_ids))
+for cell_type, (_, obs, _) in cpm.items():
+    pb.obs[cell_type] = obs.join(H, on='ID', how='left') 
+
+de = pb\
+    .DE(DE_label_column='S0', 
+        case_control=False, 
+        covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
+        include_library_size_as_covariate=True,
+        voom_plot_directory='figures/DE/voom/p400_H')
+de.write_csv('results/DE/p400_H.csv')     
+
+
+
+
 fig, ax = plt.subplots(figsize=(8, 7)) 
 MSE_values = []
-spar_W_min, spar_H_min = min([spar for spar in MSE_trial.keys()])
-for (current_spar), MSE in MSE_trial.items():
-    mean_MSE = MSE.groupby('rank').mean()
+spar_min = min([spar for spar in MSE_trial.keys()])
+for (current_spar), mean_MSE in MSE_trial.items():
     MSE_values.extend(mean_MSE.values) 
-    rank_1se = r_1se_trial[current_spar]
+    rank_1se = rank_1se_trial[current_spar]
     ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=0.1)
     ax.scatter(rank_1se, mean_MSE[rank_1se], color='black', s=16, alpha=0.1)
-MSE_select = MSE_trial[spar_W_select, spar_H_select]
-mean_MSE = MSE_select.groupby('rank').mean()
-rank_select = r_1se_trial[spar_W_select, spar_H_select]
+mean_MSE_select = MSE_trial[spar_select]
+rank_select = rank_1se_trial[spar_select]
 lower, upper = np.quantile(MSE_values, [0, 0.9])
 ax.set_ylim(bottom=lower-0.05, top=upper)
-ax.plot(mean_MSE.index, mean_MSE.values, linewidth = 3, color='red')
-ax.scatter(rank_select, mean_MSE[rank_select], color='red', s=80)
-#ax.set_xticks(ticks=mean_MSE.index)
+ax.plot(mean_MSE_select.index, mean_MSE_select.values, 
+        linewidth = 3, color='red')
+ax.scatter(rank_select, mean_MSE_select[rank_select], color='red', s=80)
+#ax.set_xticks(ticks=mean_MSE_select.index)
 ax.set_yscale('log')
 ax.set_title(rf'$\mathbf{{All\ cell\ types}}$'
             + "\nMSE across Optuna trials\n"
-            + f"\nBest rank: {rank_select},\n"
-            + f"\nBest spar_W: {spar_W_select:.2g}, Min spar_W: {spar_W_min:.2g},\n"
-            + f"\nBest spar_H: {spar_H_select:.2g}, Min spar_H: {spar_H_min:.2g}\n")
+            + f"Best rank: {rank_select}, "
+            + f"Best spar: {spar_select:.2g}, Min spar: {spar_min:.2g}")
 ax.set_xlabel('Rank', fontsize=12, fontweight='bold')
 ax.set_ylabel('Mean MSE', fontsize=12, fontweight='bold')
 fig.subplots_adjust(bottom=0.1, top=0.9, hspace=0.3, wspace=0.25)
 savefig(f"figures/NMF/MSE/p400_MSE{save_name}.png", dpi=300)
 
+
+meta = cpm.obs[next(cpm.keys())]
+meta.write_csv('results/NMF/A/p400_metadata.tsv', separator='\t')
+pd.DataFrame(cell_types).to_csv('results/NMF/A/p400_celltypes.tsv', 
+                                sep='\t', index=False)
+
 to_r(np.array(cell_types), 'cell_types')
 to_r(A, 'A', format='matrix', rownames=genes)
 to_r(A_r, 'A_r', format='matrix', rownames=genes)
+
 to_r(W.drop('gene'), "W", rownames=W['gene'])
 to_r(H.drop('ID'), "H", rownames=shared_ids)
 to_r(save_name, 'save_name')
@@ -248,20 +339,20 @@ suppressPackageStartupMessages({
         library(scico)
         library(ggsci)
     })
-    mat = A_r
+    mat = A
     row_order = get_order(seriate(dist(mat), method = "OLO"))
     col_order = get_order(seriate(dist(t(mat)), method = "OLO"))
     
-    create_color_list = function(data, palette) {
-        n = ncol(data)
-        cols = scico(n+1, palette = palette)[1:n]
-        col_funs = mapply(function(col, max_val) {
-            colorRamp2(c(0, max_val), c("white", col))
-            }, cols, apply(data, 2, max), SIMPLIFY = FALSE)
-        setNames(col_funs, colnames(data))
-    }
-    col_list_H = create_color_list(H, "batlow")
-    col_list_W = create_color_list(W, "batlow")
+    # create_color_list = function(data, palette) {
+    #     n = ncol(data)
+    #     cols = scico(n+1, palette = palette)[1:n]
+    #     col_funs = mapply(function(col, max_val) {
+    #         colorRamp2(c(0, max_val), c("white", col))
+    #         }, cols, apply(data, 2, max), SIMPLIFY = FALSE)
+    #     setNames(col_funs, colnames(data))
+    # }
+    # col_list_H = create_color_list(H, "batlow")
+    # col_list_W = create_color_list(W, "batlow")
     colors = pal_frontiers()(length(unique(cell_types)))
     names(colors) = unique(cell_types)
     
@@ -276,19 +367,19 @@ suppressPackageStartupMessages({
             title_gp = gpar(fontsize = 7, fontface = "bold"),
             labels_gp = gpar(fontsize = 5)))
     
-    hr2 = rowAnnotation( 
-        df = W, col = col_list_W,
-        simple_anno_size = unit(0.3, "cm"),
-        annotation_name_gp = gpar(fontsize = 8),
-        annotation_name_side = "bottom",
-        show_legend = FALSE)
+    # hr2 = rowAnnotation( 
+    #     df = W, col = col_list_W,
+    #     simple_anno_size = unit(0.3, "cm"),
+    #     annotation_name_gp = gpar(fontsize = 8),
+    #     annotation_name_side = "bottom",
+    #     show_legend = FALSE)
      
-    hb = HeatmapAnnotation(
-        df = H, col = col_list_H,
-        simple_anno_size = unit(0.3, "cm"),
-        annotation_name_gp = gpar(fontsize = 8),
-        annotation_name_side = "left",    
-        show_legend = FALSE)         
+    # hb = HeatmapAnnotation(
+    #     df = H, col = col_list_H,
+    #     simple_anno_size = unit(0.3, "cm"),
+    #     annotation_name_gp = gpar(fontsize = 8),
+    #     annotation_name_side = "left",    
+    #     show_legend = FALSE)         
 
     col_fun = colorRamp2(quantile(mat, probs = c(0.00, 1.00)), 
         hcl_palette = "Batlow", reverse = TRUE)
@@ -300,9 +391,9 @@ suppressPackageStartupMessages({
         cluster_columns = F,
         show_row_names = FALSE,
         show_column_names = FALSE,
-        bottom_annotation = hb,
+        # bottom_annotation = hb,
         left_annotation = hr1,
-        right_annotation = hr2,
+        # right_annotation = hr2,
         col = col_fun,
         name = "normalized\nexpression",
         heatmap_legend_param = list(
@@ -311,7 +402,7 @@ suppressPackageStartupMessages({
         show_heatmap_legend = TRUE,
         use_raster = FALSE
     )
-    file_name = paste0("figures/NMF/A/p400_Ar", save_name, ".png")
+    file_name = paste0("figures/NMF/A/p400_A", save_name, ".png")
     png(file = file_name, width=7, height=7, units="in", res=1200)
     draw(h)
     dev.off()

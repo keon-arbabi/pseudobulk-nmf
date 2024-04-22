@@ -784,3 +784,205 @@ for cell_type, (X, obs, var) in pb.items():
 with open('results/differential-expression/p400_ruvseq.pkl', 'wb') as file:
     pickle.dump(de_ruv, file)
 
+rank = 5
+
+# Parameters
+tols = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5]
+max_iters = range(100, 1001, 100)
+
+# Storage for results
+errors_for_tols = []
+errors_for_iters = []
+
+# Reconstruction error over different tolerances
+for tol in tols:
+    model = NMF(n_components=rank, init='nndsvd', l1_ratio=0, tol=tol, max_iter=np.iinfo('int32').max)
+    model.fit(A_masked)
+    errors_for_tols.append(model.reconstruction_err_)
+
+# Reconstruction error over different iterations
+for max_iter in max_iters:
+    model = NMF(n_components=rank, init='nndsvd', l1_ratio=0, tol=1e-4, max_iter=max_iter)
+    model.fit(A_masked)
+    errors_for_iters.append(model.reconstruction_err_)
+
+# Find common reconstruction error range for y-axis
+min_error = min(min(errors_for_tols), min(errors_for_iters))
+max_error = max(max(errors_for_tols), max(errors_for_iters))
+
+# Find x-axis value for same reconstruction error
+common_error_value = None
+for tol, error_tol in zip(tols, errors_for_tols):
+    for iter, error_iter in zip(max_iters, errors_for_iters):
+        if np.isclose(error_tol, error_iter, atol=1e-2):  # Adjust atol as necessary
+            common_error_value = (tol, iter)
+            break
+    if common_error_value:
+        break
+
+# Plotting
+fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+
+axs[0].plot(tols, errors_for_tols, marker='o')
+axs[0].set_xscale('log')
+axs[0].set_xlabel('Tolerance')
+axs[0].set_ylabel('Reconstruction Error')
+axs[0].set_title('Error vs Tolerance')
+axs[0].set_ylim([min_error, max_error])
+
+axs[1].plot(max_iters, errors_for_iters, marker='o')
+axs[1].set_xlabel('Max Iterations')
+axs[1].set_ylabel('Reconstruction Error')
+axs[1].set_title('Error vs Max Iterations')
+axs[1].set_ylim([min_error, max_error])
+
+# Indicate the x-axis value for the same error, if found
+if common_error_value:
+    axs[0].axvline(x=common_error_value[0], color='r', linestyle='--', label=f"Common Error at tol={common_error_value[0]}")
+    axs[1].axvline(x=common_error_value[1], color='r', linestyle='--', label=f"Common Error at iter={common_error_value[1]}")
+    axs[0].legend()
+    axs[1].legend()
+
+plt.tight_layout()
+plt.savefig('tmp.png')
+
+
+
+study = optuna.create_study(
+    sampler=optuna.samplers.TPESampler(multivariate=True),
+    direction='minimize')
+study.optimize(lambda trial: objective(
+    trial, MSE_trial, r_1se_trial, A, rank_max=20, verbose=True), 
+    n_trials=20)
+
+
+
+import os, sys, optuna, logging, pickle
+import polars as pl, pandas as pd, numpy as np
+import seaborn as sns
+import matplotlib.pylab as plt
+
+os.chdir('projects/def-wainberg/karbabi/single-cell-nmf')
+from sklearn.decomposition import NMF
+from utils import Pseudobulk, Timer, debug, savefig
+from ryp import r, to_r 
+from project_utils import normalize_matrix
+
+#debug(third_party=True)
+
+def sparseness_hoyer(x):
+    """
+    The sparseness of array x is a real number in [0, 1], where sparser array
+    has value closer to 1. Sparseness is 1 iff the vector contains a single
+    nonzero component and is equal to 0 iff all components of the vector are 
+    the same
+        
+    modified from Hoyer 2004: [sqrt(n)-L1/L2]/[sqrt(n)-1]
+    adapted from nimfa package: https://nimfa.biolab.si/
+    """
+    from math import sqrt 
+    eps = np.finfo(x.dtype).eps if 'int' not in str(x.dtype) else 1e-9
+    n = x.size
+    if np.min(x) < 0:
+        x -= np.min(x)
+    if np.allclose(x, np.zeros(x.shape), atol=1e-6):
+        return 0.0
+    L1 = abs(x).sum()
+    L2 = sqrt(np.multiply(x, x).sum())
+    sparseness_num = sqrt(n) - (L1 + eps) / (L2 + eps)
+    sparseness_den = sqrt(n) - 1
+    return sparseness_num / sparseness_den  
+
+def cross_validate(A, rank_max, alpha_W, alpha_H, l1_ratio,
+                   reps, n, verbose=False):
+    res_MSE, res_spar = [], []
+    for rep in range(1, reps + 1):
+        np.random.seed(rep)
+        mask = np.zeros(A.shape, dtype=bool)
+        zero_indices = np.random.choice(
+            A.size, int(round(n * A.size)), replace=False)
+        mask.flat[zero_indices] = True
+        A_masked = A.copy()
+        A_masked.flat[zero_indices] = 0
+
+        for rank in range(1, rank_max + 1):
+            model = NMF(n_components=rank, init='nndsvd',
+                        alpha_W=alpha_W, alpha_H=alpha_H,
+                        l1_ratio=l1_ratio, tol=1e-2, max_iter=5000)      
+            W = model.fit_transform(A_masked)
+            H = model.components_
+            A_r = W @ H
+            MSE = np.mean((A[mask] - A_r[mask]) ** 2)
+            spar_W = sparseness_hoyer(W)
+            spar_H = sparseness_hoyer(H)
+            res_MSE.append((rep, rank, MSE))
+            res_spar.append((rep, rank, spar_W, spar_H))
+            if verbose:
+                print(f'{rep=}, {rank=}, MSE={MSE:.4f}, '
+                    f'spar_W={spar_W:.4f}, spar_H={spar_H:.4f}')
+            
+    MSE = pd.DataFrame(res_MSE, columns=['rep', 'rank', 'MSE'])\
+        .set_index(['rank', 'rep']).squeeze()
+    spar = pd.DataFrame(res_spar, columns=['rep', 'rank', 'spar_W', 'spar_H'])\
+        .set_index(['rank', 'rep']).squeeze()
+    return MSE, spar 
+
+def objective(trial, A, rank_max, reps=3, n=0.05, verbose=False):
+    from scipy.stats import sem 
+    alpha_W = trial.suggest_float('alpha_W', 1e-5, 1, log=True)
+    alpha_H = trial.suggest_float('alpha_H', 1e-5, 1, log=True)
+    l1_ratio = trial.suggest_float('l1_ratio', 0, 1, log=False)
+    
+    MSE, spar = cross_validate(A, rank_max, alpha_W, alpha_H, l1_ratio,
+                               reps, n, verbose)
+    
+    mean_MSE = MSE.groupby('rank').mean()
+    rank_best = int(mean_MSE.idxmin())
+    rank_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[rank_best] + \
+        sem(MSE[rank_best])][0])    
+    MSE = mean_MSE[rank_1se]
+    print(f'{rank_1se=}')
+
+    mean_spar = spar.groupby('rank').mean()
+    spar_W = mean_spar.loc[rank_1se, 'spar_W']
+    spar_H = mean_spar.loc[rank_1se, 'spar_H']
+    return MSE, spar_W, spar_H
+
+################################################################################
+
+save_name = '_fdr05_scikit'
+
+de = pl.read_csv('results/DE/p400_broad.csv')
+pb = Pseudobulk('data/pseudobulk/p400_qcd').filter_obs(pmAD=1)
+shared_ids = sorted(set.intersection(*(set(obs['ID'])
+                                       for obs in pb.iter_obs())))
+lcpm = pb.filter_obs(pl.col.ID.is_in(shared_ids)).log_CPM(prior_count=2)
+
+cell_types = list(lcpm.keys())
+matrices, cell_types, genes = [], [], []
+for cell_type, (X, obs, var) in lcpm.items():
+    gene_mask = var['_index'].is_in(
+        de.filter((pl.col.cell_type == cell_type) & (pl.col.FDR < 0.05))['gene']) 
+    matrices.append(normalize_matrix(X.T[gene_mask], 'rint'))    
+    gene_select = var['_index'].filter(gene_mask).to_list()    
+    genes.extend(gene_select)    
+    cell_types.extend([cell_type] * len(gene_select))
+
+A = np.vstack(matrices)
+
+study = optuna.create_study(
+    study_name='scikit-nmf', storage='sqlite:///db.sqlite3', 
+    directions=["minimize", "maximize", "maximize"])
+study.set_metric_names(["MSE", "spar_W", "spar_H"])
+study.optimize(
+    lambda trial: objective(trial, A, rank_max=30, verbose=True),
+    n_trials=100)
+
+
+
+study.trials_dataframe().to_csv(
+    f'results/NMF/trial/p400_trial_table{save_name}.csv')
+
+optuna.visualization.matplotlib.plot_pareto_front(
+    study, target_names=["MSE", "spar_W", "spar_H"])
+savefig(f"tmp.png", dpi=300)
