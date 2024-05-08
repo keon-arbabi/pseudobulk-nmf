@@ -1,58 +1,34 @@
 import numpy as np
 
-# def sparse_nmf(X, rank, spar, seed=None, verbose=False, 
-#                maxiter=1000, W = None, H = None):
-#     """
-#     Learns a sparse NMF model given data X and the rank.
-
-#     Modified from: 
-#     Block Coordinate Descent for Sparse NMF
-#     http://arxiv.org/abs/1301.3527
-#     """
-#     if W is None and H is None:
-#         assert seed is not None
-#         W, H = init_nmf(X, rank, spar, seed)
-#     Obj = np.zeros(maxiter)
-#     for i in range(maxiter):
-#         Obj[i] = np.linalg.norm(X - np.dot(W, H), 'fro')
-#         if verbose:
-#             print('iter: {} Obj: {}'.format(i + 1, Obj[i]))
-#         W = update_W(X, W, H, spar)
-#         H = update_H(X, W, H)
-#     return W, H
-
-
-def sparse_nmf(X, rank, spar, W = None, H = None,
-               tol=1e-5, maxiter=1000, seed=None, verbose=False):
+def sparse_nmf(X, rank, spar, tol=1e-4, seed=None, verbose=0, 
+               maxiter=1000, W = None, H = None):
     """
     Learns a sparse NMF model given data X and the rank.
 
     Modified from: 
     Block Coordinate Descent for Sparse NMF
     http://arxiv.org/abs/1301.3527
+    
     """
+    from collections import deque
     if W is None and H is None:
         assert seed is not None
         W, H = init_nmf(X, rank, spar, seed)
-    Obj = np.zeros(maxiter)
-    error_at_init = np.linalg.norm(X - np.dot(W, H), 'fro')
-    previous_error = error_at_init
-
-    for n_iter in range(maxiter):
+    prev_errors = deque(maxlen=10)
+    norm = np.linalg.norm(X, 'fro')
+    
+    for i in range(maxiter):
         W = update_W(X, W, H, spar)
         H = update_H(X, W, H)
-        Obj[n_iter] = np.linalg.norm(X - np.dot(W, H), 'fro')
-        if verbose:
-            print('iter: {} Obj: {}'.format(n_iter + 1, Obj[n_iter]))
-        # test convergence criterion every 10 iterations
-        if tol > 0 and n_iter > 0 and n_iter % 10 == 0:
-            error = Obj[n_iter]
-            if (previous_error - error) / error_at_init < tol:
-                if verbose:
-                    print('Convergence reached at iteration {}'.format(n_iter))
-                break
-            previous_error = error
-    return (W, H)
+        error = np.linalg.norm(X - np.dot(W, H), 'fro') / norm
+        if verbose > 1:
+            print(f'{i=}, {error=:0.10f}')
+        if i >= 10 and 0 < prev_errors[-10] - error < tol:
+            if verbose > 0:
+                print(f'Convergence reached at iteration {i}')
+            break
+        prev_errors.append(error)
+    return W, H
 
 
 def init_nmf(X, rank, spar, seed):
@@ -62,13 +38,11 @@ def init_nmf(X, rank, spar, seed):
 
     Parameters
     ----------
-
     X: {array}, shape = [n_features, n_samples]
     rank: rank of factorization
 
     Returns
     -------
-
     W : {array}
         Feature matrix of the factorization
     H : {array}
@@ -85,7 +59,7 @@ def init_nmf(X, rank, spar, seed):
 
     W = np.random.rand(m, rank)
     H = np.random.rand(rank, n)
-    return (W, H)
+    return W, H
 
 
 def update_W(X, W, H, spar):
@@ -120,7 +94,7 @@ def W_sparse_ith(W, HHt, cach, spar, i):
     V[ind] = a
     cach = cach + np.outer(V - W[:, i], HHt[i, :])
     W[:, i] = V
-    return (W, cach)
+    return W, cach
 
 
 def sparse_opt(b, k):
@@ -150,7 +124,8 @@ def sparse_opt(b, k):
     if bot >= m:
         raise ValueError(
             'Looks like the sparsity measure is not between 0 and 1')
-    obj = (-np.sqrt(y) * (np.arange(1, m + 1) + k) + sumb) / np.arange(1, m + 1)
+    with np.errstate(invalid='ignore'):
+        obj = (-np.sqrt(y) * (np.arange(1, m + 1) + k) + sumb) / np.arange(1, m + 1)
     indx = np.argmax(obj[bot:m])
     p = indx + bot - 1
     p = min(p, m - 1)

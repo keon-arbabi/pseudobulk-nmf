@@ -1,1 +1,0 @@
-/home/wainberg/ryp.py
