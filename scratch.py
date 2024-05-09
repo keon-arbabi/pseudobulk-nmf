@@ -2,12 +2,17 @@ import sys, os
 import polars as pl, numpy as np
 
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
-from utils import SingleCell, Pseudobulk, \
-    Timer, print_df, get_coding_genes, debug
+from single_cell import SingleCell, Pseudobulk
+from utils import Timer, print_df, get_coding_genes, debug
     
 os.chdir('projects/def-wainberg/karbabi/single-cell-nmf')
 
 # Columbia p400 ################################################################
+
+sc = SingleCell(
+    '../../single-cell/SEAAD/'
+    'SEAAD_DLPFC_RNAseq_all-nuclei.2023-07-19.h5ad',
+    num_threads=4)
 
 with Timer('Load single-cell data'):
     sc = SingleCell('data/single-cell/p400/p400_qced_shareable.h5ad')
