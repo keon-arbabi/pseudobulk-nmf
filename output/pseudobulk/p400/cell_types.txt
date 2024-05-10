@@ -1,0 +1,7 @@
+Microglia
+Endothelial
+Excitatory
+OPCs
+Astrocytes
+Oligodendrocytes
+Inhibitory
