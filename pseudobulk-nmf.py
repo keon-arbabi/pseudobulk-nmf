@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, gc
 import polars as pl, numpy as np
 
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
@@ -8,31 +8,33 @@ from utils import Timer, print_df, get_coding_genes, debug
 os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
 debug(third_party=True)
 
-# Columbia p400 (Green et al. 2023) ############################################
+# load single cell data ########################################################
+
+os.makedirs('output/pseudobulk/', exist_ok=True)
+os.makedirs('output/DE/voom', exist_ok=True)
 
 save_name = 'Green_broad'
 
-with Timer('load single-cell data and qc'):
+with Timer(f'[{save_name}] loading single cell'):
     sc = SingleCell('../../single-cell/Green/p400_qced_shareable.h5ad',
                     num_threads=os.cpu_count())\
         .qc(cell_type_confidence_column='cell.type.prob',
             doublet_column='is.doublet.df',
-            custom_filter=pl.col.projid.is_not_null())
+            custom_filter=pl.col.projid.is_not_null())\
+        .with_columns_obs(
+            subset=pl.col.subset.replace({'CUX2+': 'Excitatory'}),
+            projid=pl.col.projid.cast(pl.String))
 
-with Timer('pseudobulk'):
+with Timer(f'[{save_name}] pseudobulking'):
     # radc.rush.edu/docs/var/variables.htm
     rosmap_meta = pl.read_csv(
         '../../single-cell/Green/dataset_978_basic_04-21-2023_with_pmAD.csv',
         dtypes={'projid': pl.String})\
         .unique(subset='projid')\
         .drop([col for col in sc.obs.columns if col != 'projid'])
-    pb = sc\
-        .with_columns_obs(
-            subset=pl.col.subset.replace({'CUX2+': 'Excitatory'}),
-            projid=pl.col.projid.cast(pl.String))\
-        .pseudobulk(ID_column='projid', 
-                    cell_type_column='subset',
-                    additional_obs=rosmap_meta)\
+    pb = sc.pseudobulk(ID_column='projid', 
+            cell_type_column='subset',
+            additional_obs=rosmap_meta)\
         .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))\
         .with_columns_obs(
             dx_cont=pl.when(pl.col.cogdx == 1).then(0)
@@ -42,43 +44,14 @@ with Timer('pseudobulk'):
             apoe4_dosage=pl.col.apoe_genotype.cast(pl.String)
                 .str.count_matches('4').fill_null(strategy='mean'),
             pmi=pl.col.pmi.fill_null(strategy='mean'))
-    os.makedirs('output/pseudobulk/', exist_ok=True)
-    pb.save(f'output/pseudobulk/{save_name}')
-    
-if 'pb' not in globals():
-    pb = Pseudobulk(f'output/pseudobulk/{save_name}')
-        
-with Timer('qc and differential expression, case_control'):
-    de = pb\
-        .qc(case_control_column='pmAD', 
-            custom_filter=pl.col.pmAD.is_not_null())\
-        .DE(label_column='pmAD', 
-            case_control=True,
-            covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
-            include_library_size_as_covariate=True)
-    de.plot_voom(save_to=f'figures/DE/voom/{save_name}_cc', 
-                 overwrite=True)
-    de.get_hits(threshold=1).write_csv(f'output/DE/{save_name}_cc.csv')     
-    de.get_num_hits(threshold=0.05).sort('cell_type')
-    
-with Timer('qc and differential expression, continuous'):
-    de = pb\
-        .qc(case_control_column=None, 
-            custom_filter=pl.col.dx_cont.is_not_null())\
-        .DE(label_column='dx_cont', 
-            case_control=False,
-            covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
-            include_library_size_as_covariate=True)
-    de.plot_voom(save_to=f'figures/DE/voom/{save_name}_cont', 
-                 overwrite=True)
-    de.get_hits(threshold=1).write_csv(f'output/DE/{save_name}_cont.csv')  
-    de.get_num_hits(threshold=0.05).sort('cell_type')
+    if not os.path.exists(f'output/pseudobulk/{save_name}'):
+        pb.save(f'output/pseudobulk/{save_name}')
 
-# MIT p400 (Mathys et al. 2023) ################################################
+################################################################################
 
-save_name = 'Mathys_broad_cont_qced'
+save_name = 'Mathys_broad'
 
-with Timer('load single-cell data, join metadata, and qc'):
+with Timer(f'[{save_name}] loading single cell'):
     data_dir = '../../single-cell/Mathys'
     # cells.ucsc.edu/ad-aging-brain/ad-aging-brain/meta.tsv
     basic_meta = pl.read_csv(
@@ -126,9 +99,8 @@ with Timer('load single-cell data, join metadata, and qc'):
             custom_filter=pl.col.Major_Cell_Type.is_not_null(),
             doublet_column=None, allow_float=True)
 
-with Timer('pseudobulk and qc'):
-    pb = sc\
-        .pseudobulk(ID_column='projid', 
+with Timer(f'[{save_name}] pseudobulking'):
+    pb = sc.pseudobulk(ID_column='projid', 
             cell_type_column='Major_Cell_Type',
             num_threads=os.cpu_count())\
         .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))\
@@ -137,7 +109,7 @@ with Timer('pseudobulk and qc'):
                 .when(pl.col.cogdx.is_in([2, 3])).then(1)
                 .when(pl.col.cogdx.is_in([4, 5])).then(2)
                 .otherwise(None),
-            msex=pl.coalesce(['msex_right', 'msex']),
+            sex=pl.coalesce(['msex_right', 'msex']),
             age_death=pl.when(pl.col.age_death == "90+").then(90.0)
                .otherwise(pl.col.age_death.str.extract_all(r"(\d+)")
                     .list.eval(pl.element().cast(pl.Int32).mean())
@@ -146,25 +118,82 @@ with Timer('pseudobulk and qc'):
                 .fill_null(strategy='mean'),
             apoe4_dosage=pl.coalesce(['apoe_genotype_right', 'apoe_genotype'])
                 .cast(pl.String).str.count_matches('4')
-                .fill_null(strategy='mean'))\
-        .qc(case_control_column=None, 
-            custom_filter=pl.col.dx_cont.is_not_null())
-    os.makedirs('output/pseudobulk/', exist_ok=True)
-    pb.save(f'output/pseudobulk/{save_name}')
-        
-with Timer('differential expression'):
-    if 'pb' not in globals():
-        pb = Pseudobulk(f'output/pseudobulk/{save_name}')
-    de = pb.DE(label_column='dx_cont', 
-               case_control=False,
-               covariate_columns=['age_death', 'msex', 'pmi', 'apoe4_dosage'], 
-               include_library_size_as_covariate=True)
-    de.plot_voom(save_to=f'figures/DE/voom/{save_name}', overwrite=True)
-    de.get_hits(threshold=1).write_csv(f'output/DE/{save_name}.csv')
+                .fill_null(strategy='mean'))
+    if not os.path.exists(f'output/pseudobulk/{save_name}'):
+        pb.save(f'output/pseudobulk/{save_name}')
+    
+# differential expression ######################################################
 
+data_names = ['Green_broad']
+for data in data_names:
+    with Timer(f'[{data}] qc and case-control differential expression'):
+        pb = Pseudobulk(f'output/pseudobulk/{data}')
+        de = pb.qc(case_control_column='pmAD', 
+                custom_filter=pl.col.pmAD.is_not_null())\
+            .DE(label_column='pmAD', 
+                case_control=True,
+                covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
+                include_library_size_as_covariate=True)
+        de.plot_voom(save_to=f'figures/DE/voom/{data}_cc', overwrite=True)
+        de.get_hits(threshold=1).write_csv(f'output/DE/{data}_cc.csv')     
+        
+    with Timer(f'[{data}] qc and continous differential expression'):
+        de = pb.qc(case_control_column=None, 
+            custom_filter=pl.col.dx_cont.is_not_null())\
+        .DE(label_column='dx_cont', 
+            case_control=False,
+            covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
+            include_library_size_as_covariate=True)
+        de.plot_voom(save_to=f'figures/DE/voom/{data}_cont', 
+                    overwrite=True)
+        de.get_hits(threshold=1).write_csv(f'output/DE/{data}_cont.csv')  
+
+de = pl.read_csv('output/DE/Green_broad_cc.csv')
 print_df(de.get_num_hits(threshold=0.05).sort('cell_type'))
-print_df(de.get_DE_hits(de, threshold=1, num_top_hits=20)
-    .filter(cell_type='Inh'))
+
+'''
+Green
+cont
+cell_type         num_hits 
+ Astrocytes        322      
+ Endothelial       1        
+ Excitatory        689      
+ Inhibitory        169      
+ Microglia         8        
+ OPCs              2        
+ Oligodendrocytes  184      
+
+cc
+cell_type         num_hits 
+ Astrocytes        348      
+ Endothelial       13       
+ Excitatory        398      
+ Inhibitory        86       
+ Microglia         9        
+ OPCs              43       
+ Oligodendrocytes  139  
+
+Mathys 
+cont
+ cell_type  num_hits 
+ Ast        189      
+ Exc        15       
+ Inh        2        
+ Mic        12       
+ Oli        420      
+ Opc        10       
+ Vas        1   
+ 
+cc
+cell_type  num_hits 
+ Ast        573      
+ Exc        14       
+ Inh        2        
+ Mic        29       
+ Oli        641      
+ Opc        47       
+ Vas        2    
+'''
 
 ################################################################################
 
@@ -173,7 +202,7 @@ import polars as pl, pandas as pd, numpy as np
 
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
 from single_cell import Pseudobulk
-from utils import debug, savefig
+from utils import linear_regressions, fdr, debug, savefig
 from ryp import r, to_r    
 
 os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
@@ -285,11 +314,12 @@ def plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select,
 
 ################################################################################
 
-save_name = '_fdr05_lcpm_rg'
+data_name = 'Green_broad'
+save_name = 'cont_fdr05'
 
-de = pl.read_csv('results/DE/p400_broad.csv')
-pb = Pseudobulk('data/pseudobulk/p400_qcd')\
-    .filter_obs(pmAD=1)
+de = pl.read_csv(f'output/DE/{data_name}_cont.csv')
+pb = Pseudobulk(f'output/pseudobulk/{data_name}')\
+    .filter_obs(pl.col.dx_cont.is_in([1, 2]))
 shared_ids = sorted(
     set.intersection(*(set(obs['ID']) for obs in pb.iter_obs())))
 lcpm = pb\
@@ -320,9 +350,9 @@ study.optimize(lambda trial: objective(
     trial, MSE_trial, rank_1se_trial, A, rank_max=20), 
     n_trials=30)
 
-# with open(f'results/NMF/trial/{save_name}.pkl', 'wb') as file:
+# with open(f'output/NMF/trial/{data_name}_{save_name}.pkl', 'wb') as file:
 #     pickle.dump((study, MSE_trial, rank_1se_trial), file)
-with open(f'results/NMF/trial/{save_name}.pkl', 'rb') as file:
+with open(f'output/NMF/trial/{data_name}_{save_name}.pkl', 'rb') as file:
     study, MSE_trial, rank_1se_trial = pickle.load(file)
 
 spar_select = study.best_trial.params.get('spar')
@@ -341,36 +371,43 @@ W = pl.DataFrame(W)\
 H = pl.DataFrame(H.T)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(shared_ids).alias('ID'))
-W.write_csv(f'results/NMF/factors/W{save_name}.tsv', separator='\t')
-H.write_csv(f'results/NMF/factors/H{save_name}.tsv', separator='\t')
-
+    
+W.write_csv(
+    f'output/NMF/factors/W_{data_name}_{save_name}.tsv', separator='\t')
+H.write_csv(
+    f'output/NMF/factors/H_{data_name}_{save_name}.tsv', separator='\t')
 pl.DataFrame(A, shared_ids)\
     .insert_column(0, pl.Series(genes).alias('gene'))\
-    .write_csv(f'results/NMF/A/p400_A{save_name}.tsv', separator='\t')
+    .write_csv(f'output/NMF/A/p400_A{save_name}.tsv', separator='\t')
 pl.DataFrame(A_r, shared_ids)\
     .insert_column(0, pl.Series(genes).alias('gene'))\
-    .write_csv(f'results/NMF/A/p400_Ar{save_name}.tsv', separator='\t')
+    .write_csv(f'output/NMF/A/p400_Ar{save_name}.tsv', separator='\t')
 
-
-
-
-pb = Pseudobulk('data/pseudobulk/p400_qcd')\
-    .filter_obs(pl.col.ID.is_in(shared_ids))
-for cell_type, (_, obs, _) in pb.items():
-    pb.obs[cell_type] = obs.join(H, on='ID', how='left') 
-
-de = pb\
-    .DE(label_column='S2', 
-        case_control=False, 
-        covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
-        include_library_size_as_covariate=True, return_voom_info=False)
-
-de.get_num_hits()
+meta = lcpm.obs[next(lcpm.keys())]\
+    [['age_death', 'sex', 'pmi', 'apoe4_dosage']]\
+    .with_columns(sex=pl.when(pl.col.sex == 'Male').then(1).otherwise(0))
     
+H_de = pl.concat([
+    pl.DataFrame({
+        'gene': genes, 
+        'beta': res.beta[0], 
+        'SE': res.SE[0], 
+        'lower_CI': res.lower_CI[0], 
+        'upper_CI': res.upper_CI[0], 
+        'p': res.p[0]
+    }).with_columns(
+        fdr=fdr(pl.col('p')), 
+        H=pl.lit(f'S{i}'))
+    for i in range(H.shape[1]-1)
+    for res in [linear_regressions(
+        X=H[:, i+1].to_frame().hstack(meta), 
+        Y=A.T, return_significance=True)]
+])
 
+print_df(H_de.filter((pl.col.H=='S2') & (pl.col.beta > 0) & (pl.col.fdr < 0.05))
+         .sort('fdr')[['gene']], num_rows=200)
 
-
-
+print_df(H_de)
 
 
 to_r(A, 'A', format='matrix', rownames=genes)
@@ -379,6 +416,7 @@ to_r(W.drop('gene'), "W", rownames=W['gene'])
 to_r(H.drop('ID'), "H", rownames=shared_ids)
 to_r(np.array(cell_types), 'cell_types')
 to_r(save_name, 'save_name')
+to_r(data_name, 'data_name')
 meta = lcpm.obs[next(lcpm.keys())]
 to_r(meta, 'meta')
 
@@ -453,7 +491,7 @@ h = Heatmap(
     show_heatmap_legend = TRUE,
     use_raster = FALSE
 )
-file_name = paste0("figures/NMF/A/p400_A", save_name, ".png")
+file_name = paste0("figures/NMF/A/", data_name, "_", save_name, ".png")
 png(file = file_name, width=7, height=7, units="in", res=1200)
 draw(h)
 dev.off()
@@ -502,7 +540,7 @@ p_mat = p_mat[as.numeric(row_order),]
 rownames(p_mat) = rownames(cor_mat)
 colnames(p_mat) = colnames(cor_mat)
 
-png(paste0("figures/NMF/corr/p400_corr", save_name, ".png"), 
+png(paste0("figures/NMF/corr/", data_name, "_", save_name, ".png"), 
     width = 7, height = 10, units = "in", res=300)
 corrplot(cor_mat, is.corr = FALSE,  
         p.mat = p_mat, sig.level = 0.05,
