@@ -6,133 +6,165 @@ from single_cell import SingleCell, Pseudobulk
 from utils import Timer, print_df, get_coding_genes, debug
     
 os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
+debug(third_party=True)
 
 # Columbia p400 (Green et al. 2023) ############################################
 
-with Timer('Load single-cell data'):
-    sc = SingleCell('data/single-cell/p400/p400_qced_shareable.h5ad',
-                    num_threads=os.cpu_count())
-    
-rosmap_meta = \
-    pl.read_csv(
-        'data/single-cell/p400/dataset_978_basic_04-21-2023_with_pmAD.csv',
-        dtypes={'projid': pl.String})\
-    .unique(subset='projid')\
-    .drop([col for col in sc.obs.columns if col != 'projid'])
+save_name = 'Green_broad'
 
-with Timer('QC single-cell data and pseudobulk'):
-    pb = sc\
+with Timer('load single-cell data and qc'):
+    sc = SingleCell('../../single-cell/Green/p400_qced_shareable.h5ad',
+                    num_threads=os.cpu_count())\
         .qc(cell_type_confidence_column='cell.type.prob',
-            doublet_confidence_column='doublet.score',
-            custom_filter=pl.col.projid.is_not_null())\
+            doublet_column='is.doublet.df',
+            custom_filter=pl.col.projid.is_not_null())
+
+with Timer('pseudobulk'):
+    # radc.rush.edu/docs/var/variables.htm
+    rosmap_meta = pl.read_csv(
+        '../../single-cell/Green/dataset_978_basic_04-21-2023_with_pmAD.csv',
+        dtypes={'projid': pl.String})\
+        .unique(subset='projid')\
+        .drop([col for col in sc.obs.columns if col != 'projid'])
+    pb = sc\
         .with_columns_obs(
             subset=pl.col.subset.replace({'CUX2+': 'Excitatory'}),
             projid=pl.col.projid.cast(pl.String))\
         .pseudobulk(ID_column='projid', 
                     cell_type_column='subset',
-                    additional_obs=rosmap_meta)
-    pb.save('data/pseudobulk/p400')
-
-with Timer('QC pseudobulk data'):
-    pb = Pseudobulk('data/pseudobulk/p400')
-    pb = pb\
+                    additional_obs=rosmap_meta)\
         .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))\
         .with_columns_obs(
-            apoe4_dosage=pl.col.apoe_genotype.cast(pl.String)\
+            dx_cont=pl.when(pl.col.cogdx == 1).then(0)
+                .when(pl.col.cogdx.is_in([2, 3])).then(1)
+                .when(pl.col.cogdx.is_in([4, 5])).then(2)
+                .otherwise(None),
+            apoe4_dosage=pl.col.apoe_genotype.cast(pl.String)
                 .str.count_matches('4').fill_null(strategy='mean'),
-            pmi=pl.col.pmi.fill_null(strategy='mean'))\
-        .qc(case_control_column='pmAD', 
-            max_standard_deviations=2, 
-            custom_filter=pl.col.pmAD.is_not_null())
-    pb.save('data/pseudobulk/p400_qcd')
+            pmi=pl.col.pmi.fill_null(strategy='mean'))
+    os.makedirs('output/pseudobulk/', exist_ok=True)
+    pb.save(f'output/pseudobulk/{save_name}')
+    
+if 'pb' not in globals():
+    pb = Pseudobulk(f'output/pseudobulk/{save_name}')
         
-with Timer('Differential expression'):
-    pb = Pseudobulk('data/pseudobulk/p400_qcd')
+with Timer('qc and differential expression, case_control'):
     de = pb\
-        .DE(DE_label_column='pmAD', 
+        .qc(case_control_column='pmAD', 
+            custom_filter=pl.col.pmAD.is_not_null())\
+        .DE(label_column='pmAD', 
+            case_control=True,
             covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
-            include_library_size_as_covariate=True,
-            voom_plot_directory='figures/DE/voom/p400')
-    de.write_csv('results/DE/p400_broad.csv')     
-
-print(Pseudobulk.get_num_DE_hits(de, threshold=0.05).sort('cell_type'))
-print_df(Pseudobulk.get_DE_hits(de, threshold=1, num_top_hits=20)\
-         .filter(cell_type='Inhibitory'))
-
+            include_library_size_as_covariate=True)
+    de.plot_voom(save_to=f'figures/DE/voom/{save_name}_cc', 
+                 overwrite=True)
+    de.get_hits(threshold=1).write_csv(f'output/DE/{save_name}_cc.csv')     
+    de.get_num_hits(threshold=0.05).sort('cell_type')
+    
+with Timer('qc and differential expression, continuous'):
+    de = pb\
+        .qc(case_control_column=None, 
+            custom_filter=pl.col.dx_cont.is_not_null())\
+        .DE(label_column='dx_cont', 
+            case_control=False,
+            covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
+            include_library_size_as_covariate=True)
+    de.plot_voom(save_to=f'figures/DE/voom/{save_name}_cont', 
+                 overwrite=True)
+    de.get_hits(threshold=1).write_csv(f'output/DE/{save_name}_cont.csv')  
+    de.get_num_hits(threshold=0.05).sort('cell_type')
 
 # MIT p400 (Mathys et al. 2023) ################################################
 
-with Timer('Load single-cell data and join metadata'):
+save_name = 'Mathys_broad_cont_qced'
+
+with Timer('load single-cell data, join metadata, and qc'):
     data_dir = '../../single-cell/Mathys'
-    # https://cells.ucsc.edu/ad-aging-brain/ad-aging-brain/meta.tsv
+    # cells.ucsc.edu/ad-aging-brain/ad-aging-brain/meta.tsv
     basic_meta = pl.read_csv(
         f'{data_dir}/meta.tsv', 
         columns=['cellName', 'Dataset', 'Major_Cell_Type', 
-                 'Cell_Type', 'Individual'], separator='\t')
+                 'Cell_Type', 'Individual'], 
+        separator='\t')
     assert basic_meta.shape[0] == 2327742
     # syn21323366
     id_map1 = pl.read_csv(
         f'{data_dir}/MIT_ROSMAP_Multiomics_individual_metadata.csv',
         columns=['individualID', 'individualIdSource', 'subject'])\
         .filter(pl.col.subject.is_not_null())\
-        .unique()
+        .unique(subset='subject')
     # syn3191087
     id_map2 = pl.read_csv(
         f'{data_dir}/ROSMAP_clinical.csv',
-        columns=['projid', 'individualID'],
-        dtypes={'projid': pl.String})
+        columns=['projid', 'apoe_genotype', 'individualID'],
+        dtypes={'projid': pl.String}, null_values='NA')
+    # personal.broadinstitute.org/cboix/ad427_data/Data/Metadata/
+    # individual_metadata_deidentified.tsv
+    subject_meta = pl.read_csv(
+        f'{data_dir}/individual_metadata_deidentified.tsv', 
+        separator='\t', null_values='NA')
+    # radc.rush.edu/docs/var/variables.htm
     rosmap_meta = pl.read_csv(
         f'{data_dir}/dataset_978_basic_04-21-2023_with_pmAD.csv',
         dtypes={'projid': pl.String})\
         .unique(subset='projid') 
     full_meta = basic_meta\
+        .join(subject_meta, 
+              left_on='Individual', right_on='subject', how='left')\
         .join(id_map1, left_on='Individual', right_on='subject', how='left')\
         .join(id_map2, on='individualID', how='left')\
         .join(rosmap_meta, on='projid', how='left')
     assert full_meta.shape[0] == 2327742
-
+    # personal.broadinstitute.org/cboix/ad427_data/Data/Raw_data 
+    # subsetting to cells in basic_meta, which pass authors' QC (custom_filter)
+    # no doublet or cell type confidence filter applied      
     sc = SingleCell(f'{data_dir}/PFC427_raw_data.h5ad', 
                     num_threads=os.cpu_count())\
-        .join_obs(full_meta, left_on='_index', right_on='cellName', 
-                  validate='1:1')
-
-with Timer('QC single-cell data and pseudobulk'):
-    pb = sc\
+        .join_obs(full_meta, left_on='_index', right_on='cellName',
+                  validate='1:1')\
         .qc(cell_type_confidence_column=None, 
-            doublet_column=None,
-            custom_filter=pl.col.projid.is_not_null() & \
-                pl.col.Major_Cell_Type.is_not_null(),
-            error_if_float=False)\
-        .pseudobulk(ID_column='projid', 
-                    cell_type_column='Major_Cell_Type',
-                    num_threads=os.cpu_count())
+            custom_filter=pl.col.Major_Cell_Type.is_not_null(),
+            doublet_column=None, allow_float=True)
 
-with Timer('QC pseudobulk data'):
-    pb = Pseudobulk('data/pseudobulk/p400')
-    pb = pb\
+with Timer('pseudobulk and qc'):
+    pb = sc\
+        .pseudobulk(ID_column='projid', 
+            cell_type_column='Major_Cell_Type',
+            num_threads=os.cpu_count())\
         .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))\
         .with_columns_obs(
-            apoe4_dosage=pl.col.apoe_genotype.cast(pl.String)\
-                .str.count_matches('4').fill_null(strategy='mean'),
-            pmi=pl.col.pmi.fill_null(strategy='mean'))\
-        .qc(case_control_column='pmAD', 
-            max_standard_deviations=2, 
-            custom_filter=pl.col.pmAD.is_not_null())
-    pb.save('data/pseudobulk/p400_qcd')
+            dx_cont=pl.when(pl.col.cogdx == 1).then(0)
+                .when(pl.col.cogdx.is_in([2, 3])).then(1)
+                .when(pl.col.cogdx.is_in([4, 5])).then(2)
+                .otherwise(None),
+            msex=pl.coalesce(['msex_right', 'msex']),
+            age_death=pl.when(pl.col.age_death == "90+").then(90.0)
+               .otherwise(pl.col.age_death.str.extract_all(r"(\d+)")
+                    .list.eval(pl.element().cast(pl.Int32).mean())
+                    .list.first()),
+            pmi=pl.coalesce(['pmi_right', 'pmi'])
+                .fill_null(strategy='mean'),
+            apoe4_dosage=pl.coalesce(['apoe_genotype_right', 'apoe_genotype'])
+                .cast(pl.String).str.count_matches('4')
+                .fill_null(strategy='mean'))\
+        .qc(case_control_column=None, 
+            custom_filter=pl.col.dx_cont.is_not_null())
+    os.makedirs('output/pseudobulk/', exist_ok=True)
+    pb.save(f'output/pseudobulk/{save_name}')
         
-with Timer('Differential expression'):
-    pb = Pseudobulk('data/pseudobulk/p400_qcd')
-    de = pb\
-        .DE(DE_label_column='pmAD', 
-            covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
-            include_library_size_as_covariate=True,
-            voom_plot_directory='figures/DE/voom/p400')
-    de.write_csv('results/DE/p400_broad.csv')     
+with Timer('differential expression'):
+    if 'pb' not in globals():
+        pb = Pseudobulk(f'output/pseudobulk/{save_name}')
+    de = pb.DE(label_column='dx_cont', 
+               case_control=False,
+               covariate_columns=['age_death', 'msex', 'pmi', 'apoe4_dosage'], 
+               include_library_size_as_covariate=True)
+    de.plot_voom(save_to=f'figures/DE/voom/{save_name}', overwrite=True)
+    de.get_hits(threshold=1).write_csv(f'output/DE/{save_name}.csv')
 
-print(Pseudobulk.get_num_DE_hits(de, threshold=0.05).sort('cell_type'))
-print_df(Pseudobulk.get_DE_hits(de, threshold=1, num_top_hits=20)\
-         .filter(cell_type='Inhibitory'))
-
+print_df(de.get_num_hits(threshold=0.05).sort('cell_type'))
+print_df(de.get_DE_hits(de, threshold=1, num_top_hits=20)
+    .filter(cell_type='Inh'))
 
 ################################################################################
 
@@ -144,7 +176,7 @@ from single_cell import Pseudobulk
 from utils import debug, savefig
 from ryp import r, to_r    
 
-os.chdir('projects/def-wainberg/karbabi/pseudobulk-cell-nmf')
+os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
 from sklearn.decomposition._nmf import _initialize_nmf
 from sparseNMF import sparse_nmf
 
@@ -288,15 +320,15 @@ study.optimize(lambda trial: objective(
     trial, MSE_trial, rank_1se_trial, A, rank_max=20), 
     n_trials=30)
 
-# with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'wb') as file:
+# with open(f'results/NMF/trial/{save_name}.pkl', 'wb') as file:
 #     pickle.dump((study, MSE_trial, rank_1se_trial), file)
-with open(f'results/NMF/trial/p400_trial{save_name}.pkl', 'rb') as file:
+with open(f'results/NMF/trial/{save_name}.pkl', 'rb') as file:
     study, MSE_trial, rank_1se_trial = pickle.load(file)
 
 spar_select = study.best_trial.params.get('spar')
 rank_select = rank_1se_trial[spar_select]
 plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select, 
-               filename=f"figures/NMF/MSE/p400_MSE{save_name}.png")
+               filename=f"figures/NMF/MSE/{save_name}.png")
 
 W, H = _initialize_nmf(A, n_components=rank_select, init='nndsvd')
 W, H = sparse_nmf(A, rank=rank_select, spar=spar_select, W=W, H=H,
@@ -309,8 +341,8 @@ W = pl.DataFrame(W)\
 H = pl.DataFrame(H.T)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(shared_ids).alias('ID'))
-W.write_csv(f'results/NMF/factors/p400_W{save_name}.tsv', separator='\t')
-H.write_csv(f'results/NMF/factors/p400_H{save_name}.tsv', separator='\t')
+W.write_csv(f'results/NMF/factors/W{save_name}.tsv', separator='\t')
+H.write_csv(f'results/NMF/factors/H{save_name}.tsv', separator='\t')
 
 pl.DataFrame(A, shared_ids)\
     .insert_column(0, pl.Series(genes).alias('gene'))\
