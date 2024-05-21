@@ -1,213 +1,14 @@
-import sys, os, gc
-import polars as pl, numpy as np
-
-sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
-from single_cell import SingleCell, Pseudobulk
-from utils import Timer, print_df, get_coding_genes, debug
-    
-os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
-debug(third_party=True)
-
-# load single cell data ########################################################
-
-os.makedirs('output/pseudobulk/', exist_ok=True)
-os.makedirs('output/DE/voom', exist_ok=True)
-
-save_name = 'Green_broad'
-
-with Timer(f'[{save_name}] loading single cell'):
-    sc = SingleCell('../../single-cell/Green/p400_qced_shareable.h5ad',
-                    num_threads=os.cpu_count())\
-        .qc(cell_type_confidence_column='cell.type.prob',
-            doublet_column='is.doublet.df',
-            custom_filter=pl.col.projid.is_not_null())\
-        .with_columns_obs(
-            subset=pl.col.subset.replace({'CUX2+': 'Excitatory'}),
-            projid=pl.col.projid.cast(pl.String))
-
-with Timer(f'[{save_name}] pseudobulking'):
-    # radc.rush.edu/docs/var/variables.htm
-    rosmap_meta = pl.read_csv(
-        '../../single-cell/Green/dataset_978_basic_04-21-2023_with_pmAD.csv',
-        dtypes={'projid': pl.String})\
-        .unique(subset='projid')\
-        .drop([col for col in sc.obs.columns if col != 'projid'])
-    pb = sc.pseudobulk(ID_column='projid', 
-            cell_type_column='subset',
-            additional_obs=rosmap_meta)\
-        .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))\
-        .with_columns_obs(
-            dx_cont=pl.when(pl.col.cogdx == 1).then(0)
-                .when(pl.col.cogdx.is_in([2, 3])).then(1)
-                .when(pl.col.cogdx.is_in([4, 5])).then(2)
-                .otherwise(None),
-            apoe4_dosage=pl.col.apoe_genotype.cast(pl.String)
-                .str.count_matches('4').fill_null(strategy='mean'),
-            pmi=pl.col.pmi.fill_null(strategy='mean'))
-    if not os.path.exists(f'output/pseudobulk/{save_name}'):
-        pb.save(f'output/pseudobulk/{save_name}')
-
-################################################################################
-
-save_name = 'Mathys_broad'
-
-with Timer(f'[{save_name}] loading single cell'):
-    data_dir = '../../single-cell/Mathys'
-    # cells.ucsc.edu/ad-aging-brain/ad-aging-brain/meta.tsv
-    basic_meta = pl.read_csv(
-        f'{data_dir}/meta.tsv', 
-        columns=['cellName', 'Dataset', 'Major_Cell_Type', 
-                 'Cell_Type', 'Individual'], 
-        separator='\t')
-    assert basic_meta.shape[0] == 2327742
-    # syn21323366
-    id_map1 = pl.read_csv(
-        f'{data_dir}/MIT_ROSMAP_Multiomics_individual_metadata.csv',
-        columns=['individualID', 'individualIdSource', 'subject'])\
-        .filter(pl.col.subject.is_not_null())\
-        .unique(subset='subject')
-    # syn3191087
-    id_map2 = pl.read_csv(
-        f'{data_dir}/ROSMAP_clinical.csv',
-        columns=['projid', 'apoe_genotype', 'individualID'],
-        dtypes={'projid': pl.String}, null_values='NA')
-    # personal.broadinstitute.org/cboix/ad427_data/Data/Metadata/
-    # individual_metadata_deidentified.tsv
-    subject_meta = pl.read_csv(
-        f'{data_dir}/individual_metadata_deidentified.tsv', 
-        separator='\t', null_values='NA')
-    # radc.rush.edu/docs/var/variables.htm
-    rosmap_meta = pl.read_csv(
-        f'{data_dir}/dataset_978_basic_04-21-2023_with_pmAD.csv',
-        dtypes={'projid': pl.String})\
-        .unique(subset='projid') 
-    full_meta = basic_meta\
-        .join(subject_meta, 
-              left_on='Individual', right_on='subject', how='left')\
-        .join(id_map1, left_on='Individual', right_on='subject', how='left')\
-        .join(id_map2, on='individualID', how='left')\
-        .join(rosmap_meta, on='projid', how='left')
-    assert full_meta.shape[0] == 2327742
-    # personal.broadinstitute.org/cboix/ad427_data/Data/Raw_data 
-    # subsetting to cells in basic_meta, which pass authors' QC (custom_filter)
-    # no doublet or cell type confidence filter applied      
-    sc = SingleCell(f'{data_dir}/PFC427_raw_data.h5ad', 
-                    num_threads=os.cpu_count())\
-        .join_obs(full_meta, left_on='_index', right_on='cellName',
-                  validate='1:1')\
-        .qc(cell_type_confidence_column=None, 
-            custom_filter=pl.col.Major_Cell_Type.is_not_null(),
-            doublet_column=None, allow_float=True)
-
-with Timer(f'[{save_name}] pseudobulking'):
-    pb = sc.pseudobulk(ID_column='projid', 
-            cell_type_column='Major_Cell_Type',
-            num_threads=os.cpu_count())\
-        .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))\
-        .with_columns_obs(
-            dx_cont=pl.when(pl.col.cogdx == 1).then(0)
-                .when(pl.col.cogdx.is_in([2, 3])).then(1)
-                .when(pl.col.cogdx.is_in([4, 5])).then(2)
-                .otherwise(None),
-            sex=pl.coalesce(['msex_right', 'msex']),
-            age_death=pl.when(pl.col.age_death == "90+").then(90.0)
-               .otherwise(pl.col.age_death.str.extract_all(r"(\d+)")
-                    .list.eval(pl.element().cast(pl.Int32).mean())
-                    .list.first()),
-            pmi=pl.coalesce(['pmi_right', 'pmi'])
-                .fill_null(strategy='mean'),
-            apoe4_dosage=pl.coalesce(['apoe_genotype_right', 'apoe_genotype'])
-                .cast(pl.String).str.count_matches('4')
-                .fill_null(strategy='mean'))
-    if not os.path.exists(f'output/pseudobulk/{save_name}'):
-        pb.save(f'output/pseudobulk/{save_name}')
-    
-# differential expression ######################################################
-
-data_names = ['Green_broad']
-for data in data_names:
-    with Timer(f'[{data}] qc and case-control differential expression'):
-        pb = Pseudobulk(f'output/pseudobulk/{data}')
-        de = pb.qc(case_control_column='pmAD', 
-                custom_filter=pl.col.pmAD.is_not_null())\
-            .DE(label_column='pmAD', 
-                case_control=True,
-                covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
-                include_library_size_as_covariate=True)
-        de.plot_voom(save_to=f'figures/DE/voom/{data}_cc', overwrite=True)
-        de.get_hits(threshold=1).write_csv(f'output/DE/{data}_cc.csv')     
-        
-    with Timer(f'[{data}] qc and continous differential expression'):
-        de = pb.qc(case_control_column=None, 
-            custom_filter=pl.col.dx_cont.is_not_null())\
-        .DE(label_column='dx_cont', 
-            case_control=False,
-            covariate_columns=['age_death', 'sex', 'pmi', 'apoe4_dosage'],
-            include_library_size_as_covariate=True)
-        de.plot_voom(save_to=f'figures/DE/voom/{data}_cont', 
-                    overwrite=True)
-        de.get_hits(threshold=1).write_csv(f'output/DE/{data}_cont.csv')  
-
-de = pl.read_csv('output/DE/Green_broad_cc.csv')
-print_df(de.get_num_hits(threshold=0.05).sort('cell_type'))
-
-'''
-Green
-cont
-cell_type         num_hits 
- Astrocytes        322      
- Endothelial       1        
- Excitatory        689      
- Inhibitory        169      
- Microglia         8        
- OPCs              2        
- Oligodendrocytes  184      
-
-cc
-cell_type         num_hits 
- Astrocytes        348      
- Endothelial       13       
- Excitatory        398      
- Inhibitory        86       
- Microglia         9        
- OPCs              43       
- Oligodendrocytes  139  
-
-Mathys 
-cont
- cell_type  num_hits 
- Ast        189      
- Exc        15       
- Inh        2        
- Mic        12       
- Oli        420      
- Opc        10       
- Vas        1   
- 
-cc
-cell_type  num_hits 
- Ast        573      
- Exc        14       
- Inh        2        
- Mic        29       
- Oli        641      
- Opc        47       
- Vas        2    
-'''
-
-################################################################################
-
 import sys, os, optuna, pickle
 import polars as pl, pandas as pd, numpy as np
 
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
 from single_cell import Pseudobulk
-from utils import linear_regressions, fdr, debug, savefig
+from utils import linear_regressions, fdr, debug, savefig, print_df
 from ryp import r, to_r    
 
 os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
 from sklearn.decomposition._nmf import _initialize_nmf
-from sparseNMF import sparse_nmf
+from sparse_nmf import sparse_nmf
 
 debug(third_party=True)
 
@@ -362,7 +163,7 @@ plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select,
 
 W, H = _initialize_nmf(A, n_components=rank_select, init='nndsvd')
 W, H = sparse_nmf(A, rank=rank_select, spar=spar_select, W=W, H=H,
-                  tol=1e-8, maxiter=np.iinfo('int32').max, verbose=2)
+                  tol=1e-4, maxiter=np.iinfo('int32').max, verbose=2)
 A_r = W @ H
 
 W = pl.DataFrame(W)\
@@ -390,6 +191,7 @@ meta = lcpm.obs[next(lcpm.keys())]\
 H_de = pl.concat([
     pl.DataFrame({
         'gene': genes, 
+        'cell_type':cell_types,
         'beta': res.beta[0], 
         'SE': res.SE[0], 
         'lower_CI': res.lower_CI[0], 
@@ -404,8 +206,15 @@ H_de = pl.concat([
         Y=A.T, return_significance=True)]
 ])
 
+H_de['p'].median()
+
+print_df(H_de.group_by('H').agg(pl.col.fdr.lt(0.05).mean()).sort('H'))
+print_df(H_de.group_by('H').agg((pl.col.fdr.lt(0.05) & pl.col.beta.gt(0)).mean()/pl.col.fdr.lt(0.05).mean()).sort('H'))
+
+
+
 print_df(H_de.filter((pl.col.H=='S2') & (pl.col.beta > 0) & (pl.col.fdr < 0.05))
-         .sort('fdr')[['gene']], num_rows=200)
+         .sort('fdr'), num_rows=200)
 
 print_df(H_de)
 
@@ -549,119 +358,3 @@ corrplot(cor_mat, is.corr = FALSE,
 dev.off() 
   
 ''')
-
-################################################################################
-from scipy.spatial.distance import pdist
-from scipy.cluster.hierarchy import linkage, leaves_list
-
-df = H.to_pandas().set_index('ID')
-df = (df-df.min())/(df.max()-df.min())
-row_order = leaves_list(linkage(pdist(df.to_numpy()),
-                               method='complete', optimal_ordering=True))
-df = df.iloc[row_order]
-
-fig, ax = plt.subplots(figsize=(5,10))    
-sns.heatmap(df, cmap='rocket_r', cbar=False, 
-            xticklabels=True, yticklabels=False, rasterized=True)
-ax.set_ylabel('Samples', fontsize=12, fontweight='bold')
-savefig('tmp.png')
-
-
-
-
-
-# meta = lcpm.obs[next(lcpm.keys())]
-# meta.write_csv('results/NMF/A/p400_metadata.tsv', separator='\t')
-# pd.DataFrame(cell_types).to_csv('results/NMF/A/p400_celltypes.tsv', 
-#                                 sep='\t', index=False)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def norm(X, p="fro"):
-    assert 1 in X.shape or p != 2, "Computing entry-wise norms only."
-    return np.linalg.norm(np.mat(X), p)
-
-def random_c(V, rank, options, seed=0):
-    from operator import itemgetter
-    rank = rank
-    p_c = options.get('p_c', int(np.ceil(1. / 5 * V.shape[1])))
-    p_r = options.get('p_r', int(np.ceil(1. / 5 * V.shape[0])))
-    l_c = options.get('l_c', int(np.ceil(1. / 2 * V.shape[1])))
-    l_r = options.get('l_r', int(np.ceil(1. / 2 * V.shape[0])))
-    
-    prng = np.random.RandomState(seed=seed)
-    W = np.mat(np.zeros((V.shape[0], rank)))
-    H = np.mat(np.zeros((rank, V.shape[1])))
-    top_c = sorted(enumerate([norm(V[:, i], 2)
-                    for i in range(
-                        V.shape[1])]), key=itemgetter(1), reverse=True)[:l_c]
-    top_r = sorted(
-        enumerate([norm(V[i, :], 2) for i in range(V.shape[0])]),
-        key=itemgetter(1), reverse=True)[:l_r]
-    
-    top_c = np.mat(list(zip(*top_c))[0])
-    top_r = np.mat(list(zip(*top_r))[0])
-    for i in range(rank):
-        W[:, i] = V[
-            :, top_c[0, prng.randint(low=0, high=l_c, size=p_c)]\
-                .tolist()[0]].mean(axis=1)
-        H[i, :] = V[
-            top_r[0, prng.randint(low=0, high=l_r, size=p_r)]\
-                .tolist()[0], :].mean(axis=0)
-    return np.array(W), np.array(H)
-
-def random_vcol(V, rank, options, seed=0):
-    rank = rank
-    p_c = options.get('p_c', int(np.ceil(1. / 5 * V.shape[1])))
-    p_r = options.get('p_r', int(np.ceil(1. / 5 * V.shape[0])))
-    prng = np.random.RandomState(seed=seed)
-    W = np.mat(np.zeros((V.shape[0], rank)))
-    H = np.mat(np.zeros((rank, V.shape[1])))
-    for i in range(rank):
-        W[:, i] = V[:, prng.randint(
-            low=0, high=V.shape[1], size=p_c)].mean(axis=1)
-        H[i, :] = V[
-            prng.randint(low=0, high=V.shape[0], size=p_r), :].mean(axis=0)
-    return np.array(W), np.array(H)
-
-n_runs = 100
-corr_list = []
-cluster_agreement  = np.zeros((A.shape[1], A.shape[1]))
-
-for run in range(n_runs):
-    #W, H = random_vcol(np.matrix(A), rank=9, options=dict(), seed=run)
-    #W, H = random_c(np.matrix(A), rank=9, options=dict(), seed=run)
-    W, H = sparse_nmf(A, rank=9, maxiter=50, spar=spar_select, 
-                      seed=run, verbose=True)
-    
-    corr_list.append(np.corrcoef(H, rowvar=False))
-    
-    cluster_membership = np.argmax(H, axis=0)
-    overlap_matrix = (cluster_membership[:, None] == \
-        cluster_membership[None, :]).astype(int)
-    cluster_agreement  += overlap_matrix
-    
-corr_sd_matrix = np.std(corr_list, axis=0)
-cluster_agreement  /= n_runs
-
-sns.clustermap(corr_sd_matrix, method='average', cmap='rocket_r',
-               xticklabels=False, yticklabels=False, figsize=(10, 10))
-plt.savefig('corr_sd_matrix3.png')
-sns.clustermap(cluster_agreement , method='average', 
-               xticklabels=False, yticklabels=False, figsize=(10, 10))
-plt.savefig('cluster_agreement3.png')
-
