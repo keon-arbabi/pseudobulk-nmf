@@ -2,15 +2,17 @@ import sys, os, optuna, pickle
 import polars as pl, pandas as pd, numpy as np
 
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
-from single_cell import Pseudobulk
-from utils import linear_regressions, fdr, debug, savefig, print_df
+from single_cell import Pseudobulk, DE
+from utils import linear_regressions, fdr, savefig, print_df, debug
 from ryp import r, to_r    
 
 os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
 from sklearn.decomposition._nmf import _initialize_nmf
 from sparse_nmf import sparse_nmf
 
-debug(third_party=True)
+os.makedirs('output/NMF/trial', exist_ok=True)
+os.makedirs('output/NMF/A', exist_ok=True)
+os.makedirs('output/NMF/factors', exist_ok=True)
 
 def sparseness_hoyer(x):
     """
@@ -49,7 +51,7 @@ def cross_validate(A, rank_max, spar, reps, n):
         for rank in range(1, rank_max + 1):
             W, H = _initialize_nmf(A_masked, rank, init='nndsvd')
             W, H = sparse_nmf(A_masked, rank=rank, spar=spar, W=W, H=H,
-                              tol=1e-4, maxiter=np.iinfo('int32').max, 
+                              tol=1e-3, maxiter=np.iinfo(np.int64).max, 
                               verbose=1)
             A_r = W @ H
             MSE = np.mean((A[mask] - A_r[mask]) ** 2)
@@ -76,9 +78,9 @@ def objective(trial, MSE_trial, rank_1se_trial, A, rank_max,
     rank_best = int(mean_MSE.idxmin())
     rank_1se = int(mean_MSE.index[mean_MSE <= mean_MSE[rank_best] + \
         sem(results.loc[rank_best, 'MSE'])][0])
-    
     # mean_sparseness = results.groupby('rank').mean()['sparseness']
     # sparseness = mean_sparseness[rank_1se]
+    
     MSE_trial[spar] = mean_MSE
     rank_1se_trial[spar] = rank_1se
     print(f'{rank_1se=}')
@@ -98,8 +100,8 @@ def plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select,
         ax.scatter(rank_1se, mean_MSE[rank_1se], color='black', s=16, alpha=0.1)
     mean_MSE_select = MSE_trial[spar_select]
     rank_select = rank_1se_trial[spar_select]
-    lower, upper = np.quantile(MSE_values, [0, 0.9])
-    ax.set_ylim(bottom=lower-0.05, top=upper)
+    lower, upper = np.quantile(MSE_values, [0, 0.8])
+    ax.set_ylim(bottom=lower-0.05, top=6)
     ax.plot(mean_MSE_select.index, mean_MSE_select.values, 
             linewidth = 3, color='red')
     ax.scatter(rank_select, mean_MSE_select[rank_select], color='red', s=80)
@@ -115,24 +117,26 @@ def plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select,
 
 ################################################################################
 
-data_name = 'Green_broad'
-save_name = 'cont_fdr05'
+study_name = 'Green_broad'
+de_name = 'dx_cont'
 
-de = pl.read_csv(f'output/DE/{data_name}_cont.csv')
-pb = Pseudobulk(f'output/pseudobulk/{data_name}')\
+de = DE(f'output/DE/{study_name}_{de_name}').table
+pb = Pseudobulk(f'output/pseudobulk/{study_name}')\
+    .qc(case_control_column=None, 
+        max_standard_deviations=2)\
     .filter_obs(pl.col.dx_cont.is_in([1, 2]))
-shared_ids = sorted(
-    set.intersection(*(set(obs['ID']) for obs in pb.iter_obs())))
+shared_ids = sorted(set.intersection(
+    *(set(obs['ID']) for obs in pb.iter_obs())))
 lcpm = pb\
     .filter_obs(pl.col.ID.is_in(shared_ids))\
     .log_CPM()\
-    .regress_out_obs(covariate_columns='pmi')
+    .regress_out_obs(covariate_columns=['pmi', 'log_num_cells'])
 
 matrices, cell_types, genes = [], [], []
 for cell_type, (X, obs, var) in lcpm.items():
     gene_mask = var['_index'].is_in(
-        de.filter((pl.col.cell_type == cell_type) & \
-            (pl.col.FDR < 0.05))['gene']) 
+        de.filter(pl.col.cell_type.eq(cell_type) & \
+            pl.col.FDR.lt(0.05))['gene']) 
     matrices.append(X.T[gene_mask]) 
     gene_select = var['_index'].filter(gene_mask).to_list()    
     genes.extend(gene_select)    
@@ -148,22 +152,22 @@ study = optuna.create_study(
     sampler=optuna.samplers.TPESampler(multivariate=True),
     direction='minimize')
 study.optimize(lambda trial: objective(
-    trial, MSE_trial, rank_1se_trial, A, rank_max=20), 
-    n_trials=30)
+    trial, MSE_trial, rank_1se_trial, A, rank_max=15), 
+    n_trials=20)
 
-# with open(f'output/NMF/trial/{data_name}_{save_name}.pkl', 'wb') as file:
-#     pickle.dump((study, MSE_trial, rank_1se_trial), file)
-with open(f'output/NMF/trial/{data_name}_{save_name}.pkl', 'rb') as file:
+with open(f'output/NMF/trial/{study_name}_{de_name}.pkl', 'wb') as file:
+    pickle.dump((study, MSE_trial, rank_1se_trial), file)
+with open(f'output/NMF/trial/{study_name}_{de_name}.pkl', 'rb') as file:
     study, MSE_trial, rank_1se_trial = pickle.load(file)
 
 spar_select = study.best_trial.params.get('spar')
 rank_select = rank_1se_trial[spar_select]
 plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select, 
-               filename=f"figures/NMF/MSE/{save_name}.png")
+               filename=f"figures/NMF/MSE/{study_name}_{de_name}.png")
 
 W, H = _initialize_nmf(A, n_components=rank_select, init='nndsvd')
 W, H = sparse_nmf(A, rank=rank_select, spar=spar_select, W=W, H=H,
-                  tol=1e-4, maxiter=np.iinfo('int32').max, verbose=2)
+                  tol=1e-6, maxiter=np.iinfo('int32').max, verbose=2)
 A_r = W @ H
 
 W = pl.DataFrame(W)\
@@ -172,60 +176,25 @@ W = pl.DataFrame(W)\
 H = pl.DataFrame(H.T)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(shared_ids).alias('ID'))
-    
+
 W.write_csv(
-    f'output/NMF/factors/W_{data_name}_{save_name}.tsv', separator='\t')
+    f'output/NMF/factors/W_{study_name}_{de_name}.tsv', separator='\t')
 H.write_csv(
-    f'output/NMF/factors/H_{data_name}_{save_name}.tsv', separator='\t')
+    f'output/NMF/factors/H_{study_name}_{de_name}.tsv', separator='\t')
 pl.DataFrame(A, shared_ids)\
     .insert_column(0, pl.Series(genes).alias('gene'))\
-    .write_csv(f'output/NMF/A/p400_A{save_name}.tsv', separator='\t')
+    .write_csv(f'output/NMF/A/p400_A{de_name}.tsv', separator='\t')
 pl.DataFrame(A_r, shared_ids)\
     .insert_column(0, pl.Series(genes).alias('gene'))\
-    .write_csv(f'output/NMF/A/p400_Ar{save_name}.tsv', separator='\t')
-
-meta = lcpm.obs[next(lcpm.keys())]\
-    [['age_death', 'sex', 'pmi', 'apoe4_dosage']]\
-    .with_columns(sex=pl.when(pl.col.sex == 'Male').then(1).otherwise(0))
-    
-H_de = pl.concat([
-    pl.DataFrame({
-        'gene': genes, 
-        'cell_type':cell_types,
-        'beta': res.beta[0], 
-        'SE': res.SE[0], 
-        'lower_CI': res.lower_CI[0], 
-        'upper_CI': res.upper_CI[0], 
-        'p': res.p[0]
-    }).with_columns(
-        fdr=fdr(pl.col('p')), 
-        H=pl.lit(f'S{i}'))
-    for i in range(H.shape[1]-1)
-    for res in [linear_regressions(
-        X=H[:, i+1].to_frame().hstack(meta), 
-        Y=A.T, return_significance=True)]
-])
-
-H_de['p'].median()
-
-print_df(H_de.group_by('H').agg(pl.col.fdr.lt(0.05).mean()).sort('H'))
-print_df(H_de.group_by('H').agg((pl.col.fdr.lt(0.05) & pl.col.beta.gt(0)).mean()/pl.col.fdr.lt(0.05).mean()).sort('H'))
-
-
-
-print_df(H_de.filter((pl.col.H=='S2') & (pl.col.beta > 0) & (pl.col.fdr < 0.05))
-         .sort('fdr'), num_rows=200)
-
-print_df(H_de)
-
+    .write_csv(f'output/NMF/A/p400_Ar{de_name}.tsv', separator='\t')
 
 to_r(A, 'A', format='matrix', rownames=genes)
 to_r(A_r, 'A_r', format='matrix', rownames=genes)
 to_r(W.drop('gene'), "W", rownames=W['gene'])
 to_r(H.drop('ID'), "H", rownames=shared_ids)
 to_r(np.array(cell_types), 'cell_types')
-to_r(save_name, 'save_name')
-to_r(data_name, 'data_name')
+to_r(de_name, 'de_name')
+to_r(study_name, 'study_name')
 meta = lcpm.obs[next(lcpm.keys())]
 to_r(meta, 'meta')
 
@@ -300,7 +269,7 @@ h = Heatmap(
     show_heatmap_legend = TRUE,
     use_raster = FALSE
 )
-file_name = paste0("figures/NMF/A/", data_name, "_", save_name, ".png")
+file_name = paste0("figures/NMF/A/", study_name, "_", de_name, ".png")
 png(file = file_name, width=7, height=7, units="in", res=1200)
 draw(h)
 dev.off()
@@ -309,12 +278,12 @@ dev.off()
 r('''
 library(tidyverse)
 library(corrplot)
-meta = meta %>%
-    select(ID, num_cells, sex, Cdx, braaksc, ceradsc, pmi, niareagansc, 
+metadata = meta %>%
+    select(ID, num_cells, sex, braaksc, ceradsc, pmi, niareagansc, 
             apoe4_dosage, tomm40_hap, age_death, age_first_ad_dx, gpath,
             amyloid, hspath_typ, dlbdx, tangles, tdp_st4, arteriol_scler,
-            caa_4gp, cvda_4gp2, ci_num2_gct, ci_num2_mct) %>%
-    rename(c("Number of cells" = num_cells, "Cognitive diagnosis" = Cdx, 
+            caa_4gp, cvda_4gp2, ci_num2_gct, ci_num2_mct, tot_cog_res) %>%
+    rename(c("Number of cells" = num_cells,  
             "Sex" = sex, "Braak stage" = braaksc, "Cerad score" = ceradsc, 
             "PMI" = pmi, "NIA-Reagan diagnosis" = niareagansc, 
             "APOE4 dosage" = apoe4_dosage, "TOMM40 haplotype" = tomm40_hap, 
@@ -326,7 +295,8 @@ meta = meta %>%
             "Cerebral amyloid angiopathy" = caa_4gp, 
             "Cerebral atherosclerosis" = cvda_4gp2, 
             "Chronic infarcts" = ci_num2_gct,
-            "Chronic microinfarcts" = ci_num2_mct)) %>%
+            "Chronic microinfarcts" = ci_num2_mct,
+            "Total cognitive reserve" = tot_cog_res)) %>%
     mutate(across(where(is.factor), as.numeric)) %>%
     mutate(across(where(is.numeric), 
             ~ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
@@ -334,27 +304,111 @@ meta = meta %>%
            `NIA-Reagan diagnosis` = rev(`NIA-Reagan diagnosis`)) %>%
     column_to_rownames(var = "ID")
 
-cor_mat = t(cor(H, meta))
-p_mat = matrix(NA, ncol(H), ncol(meta))
+#Cdx, Cognitive diagnosis
+
+cor_mat = t(cor(H, metadata))
+p_mat = matrix(NA, ncol(H), ncol(metadata))
 for (i in 1:ncol(H)) {
-    for (j in 1:ncol(meta)) {
-        p_mat[i, j] = cor.test(H[, i], meta[, j])$p.value
+    for (j in 1:ncol(metadata)) {
+        p_mat[i, j] = cor.test(H[, i], metadata[, j])$p.value
     }
 }
 p_mat = t(p_mat)
-
 row_order = get_order(seriate(dist(cor_mat), method = "OLO"))
+row_order = order(rownames(cor_mat))
+
 cor_mat = cor_mat[as.numeric(row_order),]
 p_mat = p_mat[as.numeric(row_order),]
 rownames(p_mat) = rownames(cor_mat)
 colnames(p_mat) = colnames(cor_mat)
 
-png(paste0("figures/NMF/corr/", data_name, "_", save_name, ".png"), 
-    width = 7, height = 10, units = "in", res=300)
+png(paste0("figures/NMF/corr/", study_name, "_", de_name, ".png"), 
+    width = 7, height = 8, units = "in", res=300)
 corrplot(cor_mat, is.corr = FALSE,  
-        p.mat = p_mat, sig.level = 0.05,
+        p.mat = p_mat, sig.level = 0.05, 
         insig = 'label_sig', pch.cex = 2, pch.col = "white",
         tl.col = "black")
 dev.off() 
-  
 ''')
+
+
+
+
+
+
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+H_1 = pl.read_csv(
+    f'output/NMF/factors/H_Green_broad_dx_cont.tsv', separator='\t')
+H_1 = H_1.melt(id_vars='ID', 
+    value_vars=[col for col in H_1.columns if col.startswith('S')])\
+    .sort(['ID', 'value'], descending=True)\
+    .unique(subset=['ID'])\
+    .select(['ID', 'variable'])
+H_2 = pl.read_csv(
+    f'output/NMF/factors/H_Mathys_broad_dx_cont.tsv', separator='\t')
+H_2 = H_2.melt(id_vars='ID', 
+    value_vars=[col for col in H_1.columns if col.startswith('S')])\
+    .sort(['ID', 'value'], descending=True)\
+    .unique(subset=['ID'])\
+    .select(['ID', 'variable'])    
+         
+H = H_1.join(H_2, on='ID').to_pandas()
+pd.crosstab(H['variable'], H['variable_right'])
+
+
+
+
+
+
+
+
+meta = lcpm.obs[next(lcpm.keys())]\
+    [['age_death', 'sex', 'pmi', 'apoe4_dosage']]\
+    .with_columns(sex=pl.when(pl.col.sex == 'Male').then(1).otherwise(0))
+    
+H_de = pl.concat([
+    pl.DataFrame({
+        'gene': genes, 
+        'cell_type':cell_types,
+        'beta': res.beta[0], 
+        'SE': res.SE[0], 
+        'lower_CI': res.lower_CI[0], 
+        'upper_CI': res.upper_CI[0], 
+        'p': res.p[0]
+    }).with_columns(
+        fdr=fdr(pl.col('p')), 
+        H=pl.lit(f'S{i}'))
+    for i in range(H.shape[1]-1)
+    for res in [linear_regressions(
+        X=H[:, i+1].to_frame().hstack(meta), 
+        Y=A.T, return_significance=True)]
+])
+
+H_de['p'].median()
+print_df(H_de.group_by('H').agg(pl.col.fdr.lt(0.05).mean()).sort('H'))
+print_df(H_de.group_by('H').agg((pl.col.fdr.lt(0.05) & pl.col.beta.gt(0)).mean()/
+                                pl.col.fdr.lt(0.05).mean()).sort('H'))
+print_df(H_de.filter((pl.col.H=='S2') & (pl.col.beta > 0) & (pl.col.fdr < 0.05))
+         .sort('fdr'), num_rows=200)
+print_df(H_de)
+
+
+# W.write_csv(
+#     f'output/NMF/factors/W_{study_name}_{de_name}.tsv', separator='\t')
+# H.write_csv(
+#     f'output/NMF/factors/H_{study_name}_{de_name}.tsv', separator='\t')
+# pl.DataFrame(A, shared_ids)\
+#     .insert_column(0, pl.Series(genes).alias('gene'))\
+#     .write_csv(f'output/NMF/A/p400_A{de_name}.tsv', separator='\t')
+# pl.DataFrame(A_r, shared_ids)\
+#     .insert_column(0, pl.Series(genes).alias('gene'))\
+#     .write_csv(f'output/NMF/A/p400_Ar{de_name}.tsv', separator='\t')
+
+# with open(f'output/NMF/trial/{study_name}_{de_name}.pkl', 'wb') as file:
+#     pickle.dump((study, MSE_trial, rank_1se_trial), file)
+# with open(f'output/NMF/trial/{study_name}_{de_name}.pkl', 'rb') as file:
+#     study, MSE_trial, rank_1se_trial = pickle.load(file)

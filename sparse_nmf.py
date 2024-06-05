@@ -8,7 +8,7 @@ def sparse_nmf(X, rank, spar, tol=1e-4, seed=None, verbose=0,
     Modified from: 
     Block Coordinate Descent for Sparse NMF
     http://arxiv.org/abs/1301.3527
-    
+    https://github.com/ismav/sparseNMF/blob/master/sparse_nmf.py
     """
     from collections import deque
     if W is None and H is None:
