@@ -1,5 +1,4 @@
 import sys, os, polars as pl
-
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
 from single_cell import Pseudobulk, DE
 from utils import Timer, print_df
@@ -8,28 +7,34 @@ os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
 os.makedirs('output/DE', exist_ok=True)
 os.makedirs('figures/DE/voom', exist_ok=True)
 
-resolution = 'broad'
-study_names = ['Green', 'Mathys', 'Gabitto']
-dx_column = {
-    'Green': 'pmAD', 'Mathys': 'pmAD', 'Gabitto': 'dx_cc'}
-covariates = {
-    'Green': ['age_death', 'sex', 'pmi', 'apoe4_dosage', 'log_num_cells'],
-    'Mathys': ['age_death', 'sex', 'pmi', 'apoe4_dosage', 'log_num_cells'],
-    'Gabitto': ['Age at Death', 'Sex', 'PMI', 'apoe4_dosage', 'log_num_cells']}
+#TODO: double-check dtypes (make sure categoricals )
 
+study_names = ['Green', 'Mathys', 'SEAAD']
+dx_column = {
+    'Green': 'dx_cont', 'Mathys': 'dx_cont', 'SEAAD': 'dx_cont'}
+# dx_column = {
+#     'Green': 'pmAD', 'Mathys': 'pmAD', 'SEAAD': 'dx_cc'}
+covariates = {
+    'Green': ['age_death', 'sex', 'pmi', 'apoe4_dosage'],
+    'Mathys': ['age_death', 'sex', 'pmi', 'apoe4_dosage'],
+    'SEAAD': ['Age at Death', 'Sex', 'PMI', 'apoe4_dosage']}
+
+de_results = {}
 for study in study_names:
-    with Timer(f'[{study}] differential expression'):
-        de = Pseudobulk(f'output/pseudobulk/{study}_{resolution}')\
-            .qc(case_control_column=None, 
-                custom_filter=pl.col(dx_column[study]).is_not_null())\
-            .DE(label_column=dx_column[study], 
-                case_control=False,
-                covariate_columns=covariates[study],
-                include_library_size_as_covariate=True)
-        save_name = f'{study}_{resolution}_{dx_column[study]}'
-        de.plot_voom(save_to=f'figures/DE/voom/{save_name}', overwrite=True)
-        de.save(f'output/DE/{save_name}', overwrite=True)    
-        print_df(de.get_num_hits(threshold=0.05).sort('cell_type'))
+    for level in ['broad', 'fine']:
+        with Timer(f'[{study}] differential expression'):
+            save_name = f'{study}_{level}_{dx_column[study]}'
+            de = Pseudobulk(f'output/pseudobulk/{study}_{level}')\
+                .qc(case_control_column=None, 
+                    custom_filter=pl.col(dx_column[study]).is_not_null())\
+                .DE(label_column=dx_column[study], 
+                    case_control=False,
+                    covariate_columns=covariates[study])
+            de[study] = de
+            de.plot_voom(save_to=f'figures/DE/voom/{save_name}', 
+                        overwrite=True, PNG=True)
+            de.save(f'output/DE/{save_name}', overwrite=True)    
+            print_df(de.get_num_hits(threshold=0.05).sort('cell_type'))
 
 
 
