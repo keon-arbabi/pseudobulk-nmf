@@ -78,65 +78,64 @@ def cell_type_annotation(sc, study_name, original_labels_column, directory):
 
 # Green et al. 2023 ############################################################
 
-study_name = 'Green'
-sc_dir = f'projects/def-wainberg/single-cell/{study_name}'
-sc_file = f'{sc_dir}/{study_name}_qced_labelled.h5ad'
+# study_name = 'Green'
+# sc_dir = f'projects/def-wainberg/single-cell/{study_name}'
+# sc_file = f'{sc_dir}/{study_name}_qced_labelled.h5ad'
 
-if os.path.exists(sc_file):
-    with Timer(f'[{study_name}] Loading single cell'):
-        sc = SingleCell(sc_file, num_threads=None)
-else:
-    with Timer(f'[{study_name}] Preprocessing single cell'):
-        sc = SingleCell(f'{sc_dir}/p400_qced_shareable.h5ad', 
-                        num_threads=None)
-        sc_orig = sc.copy()
-        rosmap_meta = pl.read_csv(
-            f'{sc_dir}/dataset_978_basic_04-21-2023.csv',
-            schema_overrides={'projid': pl.Int32})\
-            .unique(subset='projid')\
-            .drop([col for col in sc.obs.columns if col != 'projid'])\
-            .pipe(lambda tdf: tdf.drop([
-                col for col in tdf.columns 
-                if tdf[col].null_count() == tdf.height]))
-        sc = sc\
-            .join_obs(rosmap_meta, on='projid')\
-            .with_columns_obs(
-                projid=pl.col.projid.cast(pl.String),
-                cell_type_broad=pl.col.subset.replace(
-                    {'CUX2+': 'Excitatory'}))\
-            .qc(cell_type_confidence_column='cell.type.prob',
-                doublet_column='is.doublet.df',
-                custom_filter=pl.col.projid.is_not_null())
-        sc = cell_type_annotation(sc, 
-                study_name=study_name, 
-                original_labels_column='state', 
-                directory=sc_dir)
-        sc.X = sc_orig.X
-        sc.save(sc_file, overwrite=False)
+# if os.path.exists(sc_file):
+#     with Timer(f'[{study_name}] Loading single cell'):
+#         sc = SingleCell(sc_file, num_threads=None)
+# else:
+#     with Timer(f'[{study_name}] Preprocessing single cell'):
+#         sc = SingleCell(f'{sc_dir}/p400_qced_shareable.h5ad', 
+#                         num_threads=None)
+#         sc_orig = sc.copy()
+#         rosmap_meta = pl.read_csv(
+#             f'{sc_dir}/dataset_978_basic_04-21-2023.csv',
+#             schema_overrides={'projid': pl.Int32})\
+#             .unique(subset='projid')\
+#             .drop([col for col in sc.obs.columns if col != 'projid'])\
+#             .pipe(lambda tdf: tdf.drop([
+#                 col for col in tdf.columns 
+#                 if tdf[col].null_count() == tdf.height]))
+#         sc = sc\
+#             .join_obs(rosmap_meta, on='projid')\
+#             .with_columns_obs(
+#                 projid=pl.col.projid.cast(pl.String),
+#                 cell_type_broad=pl.col.subset.replace(
+#                     {'CUX2+': 'Excitatory'}))\
+#             .qc(cell_type_confidence_column='cell.type.prob',
+#                 doublet_column='is.doublet.df',
+#                 custom_filter=pl.col.projid.is_not_null())
+#         sc = cell_type_annotation(sc, 
+#                 study_name=study_name, 
+#                 original_labels_column='state', 
+#                 directory=sc_dir)
+#         sc.X = sc_orig.X
+#         sc.save(sc_file, overwrite=False)
 
-for level in ['broad', 'fine']:
-    with Timer(f'[{study_name}] Pseudobulking at the {level} level'):
-        QC_column = 'passed_QC_fine' if level == 'broad' else 'passed_QC'
-        pb = sc\
-            .pseudobulk(
-                ID_column='projid', 
-                cell_type_column=f'cell_type_{level}',
-                QC_column=QC_column,
-                num_threads=None)\
-            .filter_var(
-                pl.col._index.is_in(get_coding_genes()['gene']))\
-            .with_columns_obs(
-                dx_cont=pl.when(pl.col.cogdx == 1).then(0)
-                    .when(pl.col.cogdx.is_in([2, 3])).then(1)
-                    .when(pl.col.cogdx.is_in([4, 5])).then(2)
-                    .otherwise(None),
-                apoe4_dosage=pl.col.apoe_genotype.cast(pl.String)
-                    .str.count_matches('4').fill_null(strategy='mean'),
-                pmi=pl.col.pmi.fill_null(strategy='mean'))
-        pb.save(f'{sc_dir}/pseudobulk/{study_name}_{level}',
-                overwrite=False)
+# for level in ['broad', 'fine']:
+#     with Timer(f'[{study_name}] Pseudobulking at the {level} level'):
+#         QC_column = 'passed_QC_fine' if level == 'broad' else 'passed_QC'
+#         pb = sc\
+#             .pseudobulk(
+#                 ID_column='projid', 
+#                 cell_type_column=f'cell_type_{level}',
+#                 QC_column=QC_column,
+#                 num_threads=None)\
+#             .filter_var(
+#                 pl.col._index.is_in(get_coding_genes()['gene']))\
+#             .with_columns_obs(
+#                 dx_cont=pl.when(pl.col.cogdx == 1).then(0)
+#                     .when(pl.col.cogdx.is_in([2, 3])).then(1)
+#                     .when(pl.col.cogdx.is_in([4, 5])).then(2)
+#                     .otherwise(None),
+#                 apoe4_dosage=pl.col.apoe_genotype.cast(pl.String)
+#                     .str.count_matches('4').fill_null(strategy='mean'),
+#                 pmi=pl.col.pmi.fill_null(strategy='mean'))
+#         pb.save(f'{sc_dir}/pseudobulk/{level}', overwrite=False)
 
-del sc, pb; gc.collect()
+# del sc, pb; gc.collect()
 
 # Mathys et al. 2023 ############################################################
 # # basic_meta: cells.ucsc.edu/ad-aging-brain/ad-aging-brain/meta.tsv
@@ -229,8 +228,7 @@ for level in ['broad', 'fine']:
                     'apoe_genotype_right', 'apoe_genotype'])
                     .cast(pl.String).str.count_matches('4')
                     .fill_null(strategy='mean'))
-        pb.save(f'{sc_dir}/pseudobulk/{study_name}_{level}',
-                overwrite=True)
+        pb.save(f'{sc_dir}/pseudobulk/{level}', overwrite=True)
         
 del sc, pb; gc.collect()
 
@@ -238,75 +236,75 @@ del sc, pb; gc.collect()
 # sea-ad-single-cell-profiling.s3.amazonaws.com/index.html#DLPFC/RNAseq/
 # portal.brain-map.org/explore/seattle-alzheimers-disease/seattle-alzheimers-disease-brain-cell-atlas-download?edit&language=en
 
-study_name = 'SEAAD'
-sc_dir = f'projects/def-wainberg/single-cell/{study_name}'
+# study_name = 'SEAAD'
+# sc_dir = f'projects/def-wainberg/single-cell/{study_name}'
 
-with Timer(f'[{study_name}] Loading single cell'):
-    sc = SingleCell(
-        f'{sc_dir}/SEAAD_DLPFC_RNAseq_all-nuclei.2024-02-13.h5ad',
-        num_threads=None)\
-        .cast_obs({'Donor ID': pl.String, 'Class': pl.String, 
-                   'Subclass': pl.String})
-    donor_metadata = pl.read_excel(
-        f'{sc_dir}/sea-ad_cohort_donor_metadata.xlsx')
-    pseudoprogression_scores = pl.read_csv(
-        f'{sc_dir}/pseudoprogression_scores.csv')
-    sc = sc\
-        .join_obs(donor_metadata.select(['Donor ID'] +
-            list(set(donor_metadata.columns).difference(sc.obs.columns))),
-            on='Donor ID', validate='m:1')\
-        .join_obs(pseudoprogression_scores, on='Donor ID', validate='m:1')\
-        .with_columns_obs(
-            pl.col('Doublet score').gt(0.5).alias('Is doublet'),
-            pl.coalesce(
-                pl.col.Subclass.replace({
-                    'Astro': 'Astrocytes', 'Endo': 'Endothelial', 
-                    'Micro-PVM': 'Microglia', 'Oligo': 'Oligodendrocytes',
-                    'OPC': 'OPCs', 'VLMC': 'Endothelial'},
-                    default=None),
-                pl.col.Class.replace({
-                    'exc': 'Excitatory', 'inh': 'Inhibitory'}, 
-                    default=None))
-                .alias('cell_type_broad'),
-            pl.col.Subclass.alias('cell_type_fine'))\
-        .qc(doublet_column='Is doublet',
-            cell_type_confidence_column='Class confidence',
-            custom_filter='Used in analysis',
-            allow_float=True)
+# with Timer(f'[{study_name}] Loading single cell'):
+#     sc = SingleCell(
+#         f'{sc_dir}/SEAAD_DLPFC_RNAseq_all-nuclei.2024-02-13.h5ad',
+#         num_threads=None)\
+#         .cast_obs({'Donor ID': pl.String, 'Class': pl.String, 
+#                    'Subclass': pl.String})
+#     donor_metadata = pl.read_excel(
+#         f'{sc_dir}/sea-ad_cohort_donor_metadata.xlsx')
+#     pseudoprogression_scores = pl.read_csv(
+#         f'{sc_dir}/pseudoprogression_scores.csv')
+#     sc = sc\
+#         .join_obs(donor_metadata.select(['Donor ID'] +
+#             list(set(donor_metadata.columns).difference(sc.obs.columns))),
+#             on='Donor ID', validate='m:1')\
+#         .join_obs(pseudoprogression_scores, on='Donor ID', validate='m:1')\
+#         .with_columns_obs(
+#             pl.col('Doublet score').gt(0.5).alias('Is doublet'),
+#             pl.coalesce(
+#                 pl.col.Subclass.replace({
+#                     'Astro': 'Astrocytes', 'Endo': 'Endothelial', 
+#                     'Micro-PVM': 'Microglia', 'Oligo': 'Oligodendrocytes',
+#                     'OPC': 'OPCs', 'VLMC': 'Endothelial'},
+#                     default=None),
+#                 pl.col.Class.replace({
+#                     'exc': 'Excitatory', 'inh': 'Inhibitory'}, 
+#                     default=None))
+#                 .alias('cell_type_broad'),
+#             pl.col.Subclass.alias('cell_type_fine'))\
+#         .qc(doublet_column='Is doublet',
+#             cell_type_confidence_column='Class confidence',
+#             custom_filter='Used in analysis',
+#             allow_float=True)
 
-for level in ['broad', 'fine']:
-    with Timer(f'[{study_name}] Pseudobulking at the {level} level'):
-        QC_column = 'passed_QC_fine' if level == 'broad' else 'passed_QC'
-        pb = sc\
-            .pseudobulk(
-                ID_column='Donor ID', 
-                cell_type_column=f'cell_type_{level}',
-                QC_column=QC_column,
-                num_threads=None)\
-            .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))\
-            .filter_obs(~pl.col.ID.is_in([
-                'H18.30.002', 'H19.30.002', 'H19.30.001']))\
-            .with_columns_obs(
-                dx_cc=pl.when(
-                    pl.col('Consensus Clinical Dx (choice=Alzheimers disease)')
-                    .eq('Checked')).then(1)
-                    .when(pl.col('Consensus Clinical Dx (choice=Control)')
-                    .eq('Checked')).then(0)
-                    .otherwise(None),
-                dx_cont=pl.when(
-                    pl.col('Overall AD neuropathological Change')
-                    .eq('Not AD')).then(0)
-                    .when(pl.col('Overall AD neuropathological Change')
-                    .eq('Low')).then(1)
-                    .when(pl.col('Overall AD neuropathological Change')
-                    .eq('Intermediate')).then(2)
-                    .when(pl.col('Overall AD neuropathological Change')
-                    .eq('High')).then(3)
-                    .otherwise(None),
-                apoe4_dosage=pl.col('APOE Genotype')
-                    .cast(pl.String).str.count_matches('4')
-                    .fill_null(strategy='mean'))
-        if not os.path.exists(f'output/pseudobulk/{study_name}_{level}'):
-            pb.save(f'{sc_dir}/pseudobulk/{study_name}_{level}')
+# for level in ['broad', 'fine']:
+#     with Timer(f'[{study_name}] Pseudobulking at the {level} level'):
+#         QC_column = 'passed_QC_fine' if level == 'broad' else 'passed_QC'
+#         pb = sc\
+#             .pseudobulk(
+#                 ID_column='Donor ID', 
+#                 cell_type_column=f'cell_type_{level}',
+#                 QC_column=QC_column,
+#                 num_threads=None)\
+#             .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))\
+#             .filter_obs(~pl.col.ID.is_in([
+#                 'H18.30.002', 'H19.30.002', 'H19.30.001']))\
+#             .with_columns_obs(
+#                 dx_cc=pl.when(
+#                     pl.col('Consensus Clinical Dx (choice=Alzheimers disease)')
+#                     .eq('Checked')).then(1)
+#                     .when(pl.col('Consensus Clinical Dx (choice=Control)')
+#                     .eq('Checked')).then(0)
+#                     .otherwise(None),
+#                 dx_cont=pl.when(
+#                     pl.col('Overall AD neuropathological Change')
+#                     .eq('Not AD')).then(0)
+#                     .when(pl.col('Overall AD neuropathological Change')
+#                     .eq('Low')).then(1)
+#                     .when(pl.col('Overall AD neuropathological Change')
+#                     .eq('Intermediate')).then(2)
+#                     .when(pl.col('Overall AD neuropathological Change')
+#                     .eq('High')).then(3)
+#                     .otherwise(None),
+#                 apoe4_dosage=pl.col('APOE Genotype')
+#                     .cast(pl.String).str.count_matches('4')
+#                     .fill_null(strategy='mean'))
+#         if not os.path.exists(f'output/pseudobulk/{study_name}_{level}'):
+#             pb.save(f'{sc_dir}/pseudobulk/{study_name}_{level}')
         
-del sc, pb; gc.collect()
+# del sc, pb; gc.collect()

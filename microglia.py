@@ -1,18 +1,15 @@
-import sys, os, optuna, pickle
-import polars as pl, pandas as pd, numpy as np
+import sys, optuna
+import polars as pl, polars.selectors as cs
+import numpy as np, pandas as pd
 
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
-from single_cell import Pseudobulk, DE
-from utils import linear_regressions, fdr, savefig, print_df, debug
-from ryp import r, to_r    
+from single_cell import SingleCell, Pseudobulk
+from utils import inverse_normal_transform, print_df
+from ryp import r, to_r
 
-os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
+sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/pseudobulk-nmf')
 from sklearn.decomposition._nmf import _initialize_nmf
 from sparse_nmf import sparse_nmf
-
-os.makedirs('output/NMF/trial', exist_ok=True)
-os.makedirs('output/NMF/A', exist_ok=True)
-os.makedirs('output/NMF/factors', exist_ok=True)
 
 def sparseness_hoyer(x):
     """
@@ -87,63 +84,35 @@ def objective(trial, MSE_trial, rank_1se_trial, A, rank_max,
     MSE = mean_MSE[rank_1se]
     return MSE
 
-def plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select,
-                   filename):
-    import matplotlib.pylab as plt
-    fig, ax = plt.subplots(figsize=(8, 7)) 
-    MSE_values = []
-    spar_min = min([spar for spar in MSE_trial.keys()])
-    for (current_spar), mean_MSE in MSE_trial.items():
-        MSE_values.extend(mean_MSE.values) 
-        rank_1se = rank_1se_trial[current_spar]
-        ax.plot(mean_MSE.index, mean_MSE.values, color='black', alpha=0.1)
-        ax.scatter(rank_1se, mean_MSE[rank_1se], color='black', s=16, alpha=0.1)
-    mean_MSE_select = MSE_trial[spar_select]
-    rank_select = rank_1se_trial[spar_select]
-    lower, upper = np.quantile(MSE_values, [0, 0.8])
-    ax.set_ylim(bottom=lower-0.05, top=6)
-    ax.plot(mean_MSE_select.index, mean_MSE_select.values, 
-            linewidth = 3, color='red')
-    ax.scatter(rank_select, mean_MSE_select[rank_select], color='red', s=80)
-    ax.set_xticks(ticks=mean_MSE_select.index)
-    ax.set_yscale('log')
-    ax.set_title(rf'$\mathbf{{MSE\ across\ Optuna\ trials}}$'
-                + f"\n Best rank: {rank_select}, "
-                + f"Best spar: {spar_select:.2g}, Min spar: {spar_min:.2g}")
-    ax.set_xlabel('Rank', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Mean MSE', fontsize=12, fontweight='bold')
-    fig.subplots_adjust(bottom=0.1, top=0.9, hspace=0.3, wspace=0.25)
-    savefig(filename, dpi=300)
-
 ################################################################################
 
-study_name = 'Green_broad'
-de_name = 'dx_cont'
+sc = SingleCell('projects/def-wainberg/single-cell/Green/'
+                'Green_qced_labelled.h5ad', num_threads=None)\
+    .filter_obs(cell_type_broad='Microglia', pmAD=1)
 
-de = DE(f'output/DE/{study_name}_{de_name}').table
-pb = Pseudobulk(f'output/pseudobulk/{study_name}')\
-    .qc(case_control_column=None, 
-        max_standard_deviations=2)\
-    .filter_obs(pl.col.dx_cont.is_in([1, 2]))
-shared_ids = sorted(set.intersection(
-    *(set(obs['ID']) for obs in pb.iter_obs())))
-lcpm = pb\
-    .filter_obs(pl.col.ID.is_in(shared_ids))\
-    .log_CPM()\
-    .regress_out_obs(covariate_columns=['pmi', 'log_num_cells'])
+mic_states = sc.obs.to_dummies('state').group_by('projid').sum()\
+    .select('projid', cs.contains('state'))\
+    .cast({'projid': pl.String})
+    
+hvg_sc = sc.drop_var(['highly_variable', 'highly_variable_rank'])\
+    .hvg(num_genes=1000)\
+    .var.filter(pl.col.highly_variable)['_index']
 
-matrices, cell_types, genes = [], [], []
-for cell_type, (X, obs, var) in lcpm.items():
-    gene_mask = var['_index'].is_in(
-        de.filter(pl.col.cell_type.eq(cell_type) & \
-            pl.col.FDR.lt(0.05))['gene']) 
-    matrices.append(X.T[gene_mask]) 
-    gene_select = var['_index'].filter(gene_mask).to_list()    
-    genes.extend(gene_select)    
-    cell_types.extend([cell_type] * len(gene_select))
+pb = Pseudobulk('projects/def-wainberg/single-cell/Green/pseudobulk/broad')\
+    ['Microglia']\
+    .qc(case_control_column=None)\
+    .filter_obs(pmAD=1)\
+    .with_columns_obs(log_num_cells=pl.col.num_cells.log(base=2))
 
-from utils import 
-A = np.vstack(matrices)
+pb.obs['Microglia'] = pb.obs['Microglia']\
+    .join(mic_states, left_on='ID', right_on='projid', coalesce=True)\
+    .with_columns(cs.contains('state') / pl.col.num_cells)            
+
+pb = pb.filter_var(pl.col._index.is_in(hvg_sc))
+pb = pb.CPM()
+pb = pb.regress_out_obs(covariate_columns=['pmi', 'log_num_cells'])
+
+A = pb.X['Microglia'].T
 A = np.apply_along_axis(inverse_normal_transform, 1, A)
 A += abs(np.min(A))
 
@@ -152,50 +121,30 @@ study = optuna.create_study(
     sampler=optuna.samplers.TPESampler(multivariate=True),
     direction='minimize')
 study.optimize(lambda trial: objective(
-    trial, MSE_trial, rank_1se_trial, A, rank_max=15), 
+    trial, MSE_trial, rank_1se_trial, A, rank_max=10), 
     n_trials=20)
-
-with open(f'output/NMF/trial/{study_name}_{de_name}.pkl', 'wb') as file:
-    pickle.dump((study, MSE_trial, rank_1se_trial), file)
-with open(f'output/NMF/trial/{study_name}_{de_name}.pkl', 'rb') as file:
-    study, MSE_trial, rank_1se_trial = pickle.load(file)
 
 spar_select = study.best_trial.params.get('spar')
 rank_select = rank_1se_trial[spar_select]
-plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select, 
-               filename=f"figures/NMF/MSE/{study_name}_{de_name}.png")
+
+genes = pb.var['Microglia']['_index']
+samps = pb.obs['Microglia']['ID']
 
 W, H = _initialize_nmf(A, n_components=rank_select, init='nndsvd')
 W, H = sparse_nmf(A, rank=rank_select, spar=spar_select, W=W, H=H,
                   tol=1e-6, maxiter=np.iinfo('int32').max, verbose=2)
-A_r = W @ H
 
 W = pl.DataFrame(W)\
     .rename(lambda col: col.replace('column_', 'S'))\
     .insert_column(0, pl.Series(genes).alias('gene'))
 H = pl.DataFrame(H.T)\
     .rename(lambda col: col.replace('column_', 'S'))\
-    .insert_column(0, pl.Series(shared_ids).alias('ID'))
-
-W.write_csv(
-    f'output/NMF/factors/W_{study_name}_{de_name}.tsv', separator='\t')
-H.write_csv(
-    f'output/NMF/factors/H_{study_name}_{de_name}.tsv', separator='\t')
-pl.DataFrame(A, shared_ids)\
-    .insert_column(0, pl.Series(genes).alias('gene'))\
-    .write_csv(f'output/NMF/A/p400_A{de_name}.tsv', separator='\t')
-pl.DataFrame(A_r, shared_ids)\
-    .insert_column(0, pl.Series(genes).alias('gene'))\
-    .write_csv(f'output/NMF/A/p400_Ar{de_name}.tsv', separator='\t')
+    .insert_column(0, pl.Series(samps).alias('ID'))
 
 to_r(A, 'A', format='matrix', rownames=genes)
-to_r(A_r, 'A_r', format='matrix', rownames=genes)
-to_r(W.drop('gene'), "W", rownames=W['gene'])
-to_r(H.drop('ID'), "H", rownames=shared_ids)
-to_r(np.array(cell_types), 'cell_types')
-to_r(de_name, 'de_name')
-to_r(study_name, 'study_name')
-meta = lcpm.obs[next(lcpm.keys())]
+to_r(W.drop('gene'), 'W', rownames=W['gene'])
+to_r(H.drop('ID'), 'H', rownames=H['ID'])
+meta = pb.obs['Microglia']
 to_r(meta, 'meta')
 
 r('''
@@ -220,19 +169,6 @@ create_color_list = function(data, palette) {
 }
 col_list_H = create_color_list(H, "batlow")
 col_list_W = create_color_list(W, "batlow")
-colors = pal_frontiers()(length(unique(cell_types)))
-names(colors) = unique(cell_types)
-
-hr1 = rowAnnotation(
-    cell_types = factor(cell_types),
-    simple_anno_size = unit(0.3, "cm"),
-    col = list(cell_types = colors),
-    name = "cell type",
-    show_annotation_name = FALSE,
-    show_legend = TRUE,
-    annotation_legend_param  = list(
-        title_gp = gpar(fontsize = 7, fontface = "bold"),
-        labels_gp = gpar(fontsize = 5)))
 
 hr2 = rowAnnotation( 
     df = W, col = col_list_W,
@@ -259,7 +195,6 @@ h = Heatmap(
     show_row_names = FALSE,
     show_column_names = FALSE,
     bottom_annotation = hb,
-    left_annotation = hr1,
     right_annotation = hr2,
     col = col_fun,
     name = "normalized\nexpression",
@@ -269,8 +204,8 @@ h = Heatmap(
     show_heatmap_legend = TRUE,
     use_raster = FALSE
 )
-file_name = paste0("figures/NMF/A/", study_name, "_", de_name, ".png")
-png(file = file_name, width=7, height=7, units="in", res=1200)
+file_name = paste0("projects/def-wainberg/karbabi/pseudobulk-nmf/A_tmp.png")
+png(file = file_name, width=7, height=6, units="in", res=1200)
 draw(h)
 dev.off()
 ''')
@@ -282,7 +217,11 @@ metadata = meta %>%
     select(ID, num_cells, sex, braaksc, ceradsc, pmi, niareagansc, 
             apoe4_dosage, tomm40_hap, age_death, age_first_ad_dx, gpath,
             amyloid, hspath_typ, dlbdx, tangles, tdp_st4, arteriol_scler,
-            caa_4gp, cvda_4gp2, ci_num2_gct, ci_num2_mct, tot_cog_res) %>%
+            caa_4gp, cvda_4gp2, ci_num2_gct, ci_num2_mct, tot_cog_res, 
+            state_Mic.1, state_Mic.10, state_Mic.11, state_Mic.12,
+            state_Mic.13, state_Mic.14, state_Mic.15, state_Mic.16,
+            state_Mic.2, state_Mic.3, state_Mic.4, state_Mic.5, 
+            state_Mic.6, state_Mic.7, state_Mic.8, state_Mic.9) %>%
     rename(c("Number of cells" = num_cells,  
             "Sex" = sex, "Braak stage" = braaksc, "Cerad score" = ceradsc, 
             "PMI" = pmi, "NIA-Reagan diagnosis" = niareagansc, 
@@ -304,8 +243,6 @@ metadata = meta %>%
            `NIA-Reagan diagnosis` = rev(`NIA-Reagan diagnosis`)) %>%
     column_to_rownames(var = "ID")
 
-#Cdx, Cognitive diagnosis
-
 cor_mat = t(cor(H, metadata))
 p_mat = matrix(NA, ncol(H), ncol(metadata))
 for (i in 1:ncol(H)) {
@@ -322,8 +259,8 @@ p_mat = p_mat[as.numeric(row_order),]
 rownames(p_mat) = rownames(cor_mat)
 colnames(p_mat) = colnames(cor_mat)
 
-png(paste0("figures/NMF/corr/", study_name, "_", de_name, ".png"), 
-    width = 7, height = 8, units = "in", res=300)
+png(paste0("projects/def-wainberg/karbabi/pseudobulk-nmf/cor_tmp.png"), 
+    width = 6, height = 9, units = "in", res=300)
 corrplot(cor_mat, is.corr = FALSE,  
         p.mat = p_mat, sig.level = 0.05, 
         insig = 'label_sig', pch.cex = 2, pch.col = "white",
@@ -338,77 +275,4 @@ dev.off()
 
 
 
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-H_1 = pl.read_csv(
-    f'output/NMF/factors/H_Green_broad_dx_cont.tsv', separator='\t')
-H_1 = H_1.melt(id_vars='ID', 
-    value_vars=[col for col in H_1.columns if col.startswith('S')])\
-    .sort(['ID', 'value'], descending=True)\
-    .unique(subset=['ID'])\
-    .select(['ID', 'variable'])
-H_2 = pl.read_csv(
-    f'output/NMF/factors/H_Mathys_broad_dx_cont.tsv', separator='\t')
-H_2 = H_2.melt(id_vars='ID', 
-    value_vars=[col for col in H_1.columns if col.startswith('S')])\
-    .sort(['ID', 'value'], descending=True)\
-    .unique(subset=['ID'])\
-    .select(['ID', 'variable'])    
-         
-H = H_1.join(H_2, on='ID').to_pandas()
-pd.crosstab(H['variable'], H['variable_right'])
-
-
-
-
-
-
-
-
-meta = lcpm.obs[next(lcpm.keys())]\
-    [['age_death', 'sex', 'pmi', 'apoe4_dosage']]\
-    .with_columns(sex=pl.when(pl.col.sex == 'Male').then(1).otherwise(0))
-    
-H_de = pl.concat([
-    pl.DataFrame({
-        'gene': genes, 
-        'cell_type':cell_types,
-        'beta': res.beta[0], 
-        'SE': res.SE[0], 
-        'lower_CI': res.lower_CI[0], 
-        'upper_CI': res.upper_CI[0], 
-        'p': res.p[0]
-    }).with_columns(
-        fdr=fdr(pl.col('p')), 
-        H=pl.lit(f'S{i}'))
-    for i in range(H.shape[1]-1)
-    for res in [linear_regressions(
-        X=H[:, i+1].to_frame().hstack(meta), 
-        Y=A.T, return_significance=True)]
-])
-
-H_de['p'].median()
-print_df(H_de.group_by('H').agg(pl.col.fdr.lt(0.05).mean()).sort('H'))
-print_df(H_de.group_by('H').agg((pl.col.fdr.lt(0.05) & pl.col.beta.gt(0)).mean()/
-                                pl.col.fdr.lt(0.05).mean()).sort('H'))
-print_df(H_de.filter((pl.col.H=='S2') & (pl.col.beta > 0) & (pl.col.fdr < 0.05))
-         .sort('fdr'), num_rows=200)
-print_df(H_de)
-
-
-# W.write_csv(
-#     f'output/NMF/factors/W_{study_name}_{de_name}.tsv', separator='\t')
-# H.write_csv(
-#     f'output/NMF/factors/H_{study_name}_{de_name}.tsv', separator='\t')
-# pl.DataFrame(A, shared_ids)\
-#     .insert_column(0, pl.Series(genes).alias('gene'))\
-#     .write_csv(f'output/NMF/A/p400_A{de_name}.tsv', separator='\t')
-# pl.DataFrame(A_r, shared_ids)\
-#     .insert_column(0, pl.Series(genes).alias('gene'))\
-#     .write_csv(f'output/NMF/A/p400_Ar{de_name}.tsv', separator='\t')
-
-# with open(f'output/NMF/trial/{study_name}_{de_name}.pkl', 'wb') as file:
-#     pickle.dump((study, MSE_trial, rank_1se_trial), file)
-# with open(f'output/NMF/trial/{study_name}_{de_name}.pkl', 'rb') as file:
-#     study, MSE_trial, rank_1se_trial = pickle.load(file)

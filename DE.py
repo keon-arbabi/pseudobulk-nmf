@@ -2,40 +2,58 @@ import sys, os, polars as pl
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
 from single_cell import Pseudobulk, DE
 from utils import Timer, print_df
-    
-os.chdir('projects/def-wainberg/karbabi/pseudobulk-nmf')
-os.makedirs('output/DE', exist_ok=True)
-os.makedirs('figures/DE/voom', exist_ok=True)
+
+sc_dir = 'projects/def-wainberg/single-cell'
+working_dir = 'projects/def-wainberg/karbabi/pseudobulk-nmf' 
+os.makedirs(f'{working_dir}/output/DE', exist_ok=True)
+os.makedirs(f'{working_dir}/figures/DE/voom', exist_ok=True)
 
 #TODO: double-check dtypes (make sure categoricals )
 
 study_names = ['Green', 'Mathys', 'SEAAD']
-dx_column = {
-    'Green': 'dx_cont', 'Mathys': 'dx_cont', 'SEAAD': 'dx_cont'}
-# dx_column = {
-#     'Green': 'pmAD', 'Mathys': 'pmAD', 'SEAAD': 'dx_cc'}
 covariates = {
     'Green': ['age_death', 'sex', 'pmi', 'apoe4_dosage'],
     'Mathys': ['age_death', 'sex', 'pmi', 'apoe4_dosage'],
     'SEAAD': ['Age at Death', 'Sex', 'PMI', 'apoe4_dosage']}
 
 de_results = {}
-for study in study_names:
-    for level in ['broad', 'fine']:
-        with Timer(f'[{study}] differential expression'):
-            save_name = f'{study}_{level}_{dx_column[study]}'
-            de = Pseudobulk(f'output/pseudobulk/{study}_{level}')\
-                .qc(case_control_column=None, 
-                    custom_filter=pl.col(dx_column[study]).is_not_null())\
-                .DE(label_column=dx_column[study], 
-                    case_control=False,
-                    covariate_columns=covariates[study])
-            de[study] = de
-            de.plot_voom(save_to=f'figures/DE/voom/{save_name}', 
-                        overwrite=True, PNG=True)
-            de.save(f'output/DE/{save_name}', overwrite=True)    
-            print_df(de.get_num_hits(threshold=0.05).sort('cell_type'))
+for type in ['cc', 'cont']:
+    dx_column = {
+        'Green': 'pmAD' if type == 'cc' else 'dx_cont',
+        'Mathys': 'pmAD' if type == 'cc' else 'dx_cont',
+        'SEAAD': 'dx_cc' if type == 'cc' else 'dx_cont'}
+    for study in study_names:
+        for level in ['broad', 'fine']:
+            with Timer(f'[{study}] differential expression at {level} level'):
+                de = Pseudobulk(f'{sc_dir}/{study}/pseudobulk/{level}')\
+                    .qc(case_control_column=\
+                        dx_column[study] if type == 'cc' else None, 
+                        custom_filter=pl.col(dx_column[study]).is_not_null(),
+                        verbose=False)\
+                    .DE(label_column=dx_column[study], 
+                        case_control=type == 'cc',
+                        covariate_columns=covariates[study],
+                        verbose=False)
+                de_results[type, study, level] = de
+                save_name = f'{study}_{level}_{dx_column[study]}'
+                de.plot_voom(f'{working_dir}/figures/DE/voom/{save_name}', 
+                            overwrite=True, PNG=True)
+                de.save(f'{working_dir}/output/DE/{save_name}', overwrite=True)
+                print(save_name)    
+                print_df(de.get_num_hits(threshold=0.1).sort('cell_type'))
 
+
+'''
+ cell_type         num_hits 
+ Astrocytes        630      
+ Endothelial       16       
+ Excitatory        1353     
+ Inhibitory        600      
+ Microglia         26       
+ OPCs              7        
+ Oligodendrocytes  243   
+ 
+'''
 
 
 de_1 = DE(f'output/DE/Green_{resolution}_{dx_column['Green']}').table 
