@@ -3,14 +3,12 @@ sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
 from single_cell import Pseudobulk, DE
 from utils import Timer, print_df
 
-sc_dir = 'projects/def-wainberg/single-cell'
+data_dir = 'projects/def-wainberg/single-cell'
 working_dir = 'projects/def-wainberg/karbabi/pseudobulk-nmf' 
 os.makedirs(f'{working_dir}/output/DE', exist_ok=True)
 os.makedirs(f'{working_dir}/figures/DE/voom', exist_ok=True)
 
-#TODO: double-check dtypes (make sure categoricals )
-
-study_names = ['Green', 'Mathys', 'SEAAD']
+study_names = ['Green']
 covariates = {
     'Green': ['age_death', 'sex', 'pmi', 'apoe4_dosage'],
     'Mathys': ['age_death', 'sex', 'pmi', 'apoe4_dosage'],
@@ -19,14 +17,27 @@ covariates = {
 de_results = {}
 for type in ['cc', 'cont']:
     dx_column = {
-        'Green': 'pmAD' if type == 'cc' else 'dx_cont',
-        'Mathys': 'pmAD' if type == 'cc' else 'dx_cont',
+        'Green': 'dx_cc' if type == 'cc' else 'dx_cont',
+        'Mathys': 'dx_cc' if type == 'cc' else 'dx_cont',
         'SEAAD': 'dx_cc' if type == 'cc' else 'dx_cont'}
+    
     for study in study_names:
         for level in ['broad', 'fine']:
             with Timer(f'[{study}] differential expression at {level} level'):
-                de = Pseudobulk(f'{sc_dir}/{study}/pseudobulk/{level}')\
-                    .qc(case_control_column=\
+                pb = Pseudobulk(f'{data_dir}/{study}/pseudobulk/{level}')
+                min_people = round(0.8 * min(
+                    max(pb.obs.items(), key=lambda x: x[1].height)[1]
+                    .filter(pl.col(dx_column[study]).is_not_null())
+                    [dx_column[study]]
+                    .value_counts()['count']))
+                drop_cell_types = [
+                    cell_type for cell_type, (_, obs, _) in pb.items()
+                    if obs.filter(pl.col(dx_column[study]).is_not_null())
+                    [dx_column[study]].value_counts()['count'].min() 
+                    < min_people]
+                pb = pb.drop_cell_types(drop_cell_types)
+
+                de = pb.qc(case_control_column=\
                         dx_column[study] if type == 'cc' else None, 
                         custom_filter=pl.col(dx_column[study]).is_not_null(),
                         verbose=False)\
@@ -42,8 +53,8 @@ for type in ['cc', 'cont']:
                 print(save_name)    
                 print_df(de.get_num_hits(threshold=0.1).sort('cell_type'))
 
-
 '''
+Green_broad_pmAD
  cell_type         num_hits 
  Astrocytes        630      
  Endothelial       16       
@@ -51,8 +62,63 @@ for type in ['cc', 'cont']:
  Inhibitory        600      
  Microglia         26       
  OPCs              7        
- Oligodendrocytes  243   
- 
+ Oligodendrocytes  243      
+
+Green_broad_dx_cont
+ cell_type         num_hits 
+ Astrocytes        697      
+ Endothelial       108      
+ Excitatory        874      
+ Inhibitory        226      
+ Microglia         18       
+ OPCs              125      
+ Oligodendrocytes  320  
+
+Green_fine_pmAD
+ cell_type        num_hits 
+ Astrocyte        646      
+ Chandelier       27       
+ Endothelial      6        
+ L2/3 IT          756      
+ L4 IT            1395     
+ L5 IT            1536     
+ L5/6 NP          134      
+ L6 CT            61       
+ L6 IT            742      
+ L6 IT Car3       15       
+ L6b              336      
+ Lamp5            76       
+ Lamp5 Lhx6       14       
+ Microglia-PVM    21       
+ OPC              7        
+ Oligodendrocyte  288      
+ Pvalb            361      
+ Sst              3        
+ VLMC             1        
+ Vip              84 
+
+Green_fine_dx_cont
+ cell_type        num_hits 
+ Astrocyte        723      
+ Chandelier       33       
+ Endothelial      26       
+ L2/3 IT          366      
+ L4 IT            1507     
+ L5 IT            1287     
+ L5/6 NP          194      
+ L6 CT            122      
+ L6 IT            846      
+ L6 IT Car3       36       
+ L6b              377      
+ Lamp5            79       
+ Lamp5 Lhx6       15       
+ Microglia-PVM    20       
+ OPC              106      
+ Oligodendrocyte  304      
+ Pvalb            261      
+ Sst              9        
+ VLMC             1        
+ Vip              116  
 '''
 
 

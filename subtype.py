@@ -118,10 +118,10 @@ def plot_MSE_trial(MSE_trial, rank_1se_trial, spar_select, rank_select,
 ################################################################################
 
 study_name = 'Green_broad'
-de_name = 'dx_cont'
+de_name = 'dx_cc'
 
 de = DE(f'output/DE/{study_name}_{de_name}').table
-pb = Pseudobulk(f'output/pseudobulk/{study_name}')\
+pb = Pseudobulk(f'output/pseudobulk/{study_name}_broad')\
     .qc(case_control_column=None, 
         max_standard_deviations=2)\
     .filter_obs(pl.col.dx_cont.is_in([1, 2]))
@@ -142,7 +142,7 @@ for cell_type, (X, obs, var) in lcpm.items():
     genes.extend(gene_select)    
     cell_types.extend([cell_type] * len(gene_select))
 
-from utils import 
+from utils import inverse_normal_transform
 A = np.vstack(matrices)
 A = np.apply_along_axis(inverse_normal_transform, 1, A)
 A += abs(np.min(A))

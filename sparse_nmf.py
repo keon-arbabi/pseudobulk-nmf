@@ -125,7 +125,8 @@ def sparse_opt(b, k):
         raise ValueError(
             'Looks like the sparsity measure is not between 0 and 1')
     with np.errstate(invalid='ignore'):
-        obj = (-np.sqrt(y) * (np.arange(1, m + 1) + k) + sumb) / np.arange(1, m + 1)
+        obj = (-np.sqrt(y) * \
+               (np.arange(1, m + 1) + k) + sumb) / np.arange(1, m + 1)
     indx = np.argmax(obj[bot:m])
     p = indx + bot - 1
     p = min(p, m - 1)
