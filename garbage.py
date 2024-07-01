@@ -1,3 +1,51 @@
+def cross_validate_redact(A, rank_max, init_type, spar, reps, n, mask_type):
+    from sklearn.model_selection import train_test_split
+    res = []
+    for rep in range(1, reps + 1):
+        sample_train, sample_test = (
+            train_test_split(range(A.shape[1]), test_size=n, random_state=rep)
+            if mask_type in ['samples', 'both'] else (range(A.shape[1]), []))
+        
+        gene_train, gene_test = (
+            train_test_split(range(A.shape[0]), test_size=n, random_state=rep)
+            if mask_type in ['genes', 'both'] else (range(A.shape[0]), []))
+        
+        A_train = A[gene_train][:, sample_train]
+
+        for rank in range(1, rank_max + 1):
+            if init_type == 'nndsvd':
+                W, H = _initialize_nmf(
+                    A_train, rank, init='nndsvd',
+                    random_state=rep*rank_max+rank-1)
+            elif init_type == 'flat':
+                W, H = initialize_flat(A_train, rank)
+            
+            W, H = sparse_nmf(
+                A_train, rank=rank, spar=spar, W=W, H=H,
+                tol=1e-2, maxiter=np.iinfo(np.int64).max, verbose=1)
+
+            H_masked = (np.linalg.lstsq(
+                W, A[gene_train][:, sample_test], rcond=None)[0]
+                if mask_type in ['samples', 'both'] else None)
+            W_masked = (np.linalg.lstsq(
+                H.T, A[gene_test][:, sample_train].T, rcond=None)[0].T
+                if mask_type in ['genes', 'both'] else None)
+
+            if mask_type == 'samples':
+                MSE = np.mean((A[:, sample_test] - W @ H_masked) ** 2)
+            elif mask_type == 'genes':
+                MSE = np.mean((A[gene_test] - W_masked @ H) ** 2)
+            else:  
+                MSE = np.mean((A[gene_test][:, sample_test] - \
+                               W_masked @ H_masked) ** 2)         
+            res.append((rep, rank, MSE, sparseness_hoyer(H)))
+
+    results = pd.DataFrame(
+        res, columns=['rep', 'rank', 'MSE', 'sparseness'])\
+        .set_index(['rank', 'rep'])
+    return results
+
+
 import os
 import polars as pl, pandas as pd, numpy as np
 import matplotlib.pylab as plt
