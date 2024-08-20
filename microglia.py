@@ -352,9 +352,9 @@ with open(f'{working_dir}/output/NMF/res.pkl', 'rb') as file:
     res = pickle.load(file)
 
 A, W, H, rank_select, spar_select, MSE_trial, rank_1se_trial = \
-    res['hvg_bulk_voom', 800, 'nndsvd']
+    res['hvg_sc', 200, 'nndsvd']
 
-genes = genesets['hvg_bulk_voom'][0:800]
+genes = genesets['hvg_sc'][0:200]
 samps = pb.obs['Microglia']['ID']
 
 W = pl.DataFrame(W)\
@@ -443,7 +443,8 @@ metadata = meta %>%
             apoe4_dosage, tomm40_hap, age_death, age_first_ad_dx, gpath,
             amyloid, hspath_typ, dlbdx, tangles, tdp_st4, arteriol_scler,
             caa_4gp, cvda_4gp2, ci_num2_gct, ci_num2_mct, tot_cog_res, 
-            cogn_global, bmi, hypertension_cum, sbp_avg, heart_cum, stroke_cum) %>%
+            cogn_global, bmi, hypertension_cum, sbp_avg, heart_cum, stroke_cum
+    ) %>%
     rename(c("Number of cells" = num_cells,  
             "Sex" = sex, "Braak stage" = braaksc, "Cerad score" = ceradsc, 
             "PMI" = pmi, "NIA-Reagan diagnosis" = niareagansc, 
@@ -495,12 +496,13 @@ dev.off()
 ''')
 
 
-# state_Mic.1, state_Mic.10, state_Mic.11, state_Mic.12,
-# state_Mic.13, state_Mic.14, state_Mic.15, state_Mic.16,
-# state_Mic.2, state_Mic.3, state_Mic.4, state_Mic.5, 
-# state_Mic.6, state_Mic.7, state_Mic.8, state_Mic.9
 
 
+
+            # state_Mic.1, state_Mic.10, state_Mic.11, state_Mic.12,
+            # state_Mic.13, state_Mic.14, state_Mic.15, state_Mic.16,
+            # state_Mic.2, state_Mic.3, state_Mic.4, state_Mic.5, 
+            # state_Mic.6, state_Mic.7, state_Mic.8, state_Mic.9
 
 
 

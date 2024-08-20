@@ -4,8 +4,10 @@ import matplotlib.pyplot as plt, seaborn as sns
 
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
 from single_cell import SingleCell
-from utils import Timer, get_coding_genes, savefig
+from utils import Timer, get_coding_genes, savefig, print_df, debug
     
+debug(third_party=True)
+
 def confusion_matrix_plot(sc, original_labels_column,
                           transferred_labels_column, directory):
     confusion_matrix = sc.obs\
@@ -41,52 +43,57 @@ def cell_type_annotation(sc, study_name, original_labels_column, directory):
             'projects/def-wainberg/single-cell/SEAAD/'
             'Reference_MTG_RNAseq_final-nuclei.2022-06-07.h5ad',
             num_threads=None)\
-            .qc(cell_type_confidence_column='subclass_confidence',
-                doublet_column=None, allow_float=True)
+            .qc(custom_filter=pl.col('subclass_confidence').ge(0.9),
+                allow_float=True,
+                num_threads=None)
     with Timer(f'[{study_name}] Highly-variable genes'):
         sc, sc_ref = sc.hvg(sc_ref, allow_float=True, num_threads=None)
     with Timer(f'[{study_name}] Normalize'):
         sc = sc.normalize(allow_float=True, num_threads=None)
         sc_ref = sc_ref.normalize(allow_float=True, num_threads=None)
     with Timer(f'[{study_name}] PCA'):
-        sc, sc_ref = sc.PCA(sc_ref, verbose=True, num_threads=None)
+        sc, sc_ref = sc.PCA(sc_ref, num_threads=1)
     with Timer(f'[{study_name}] Harmony'):
-        sc, sc_ref = sc.harmonize(sc_ref, pytorch=True, num_threads=None)
+        sc, sc_ref = sc.harmonize(sc_ref, num_threads=1)
     with Timer(f'[{study_name}] Label transfer'):
         sc = sc.label_transfer_from(
             sc_ref, 
-            cell_type_column='subclass_label',
-            cell_type_confidence_column='subclass_confidence',
-            num_index_neighbors=100)\
-            .rename_obs(({
-                'subclass_label': 'cell_type_fine',
-                'subclass_confidence': 'cell_type_fine_confidence'}))\
-            .drop_obs(['subclass_label', 'subclass_confidence'])\
-            .with_columns_obs(passed_QC_fine=pl.col.passed_QC &
-                pl.col.cell_type_fine_confidence.ge(0.9))
+            original_cell_type_column='subclass_label',
+            cell_type_column='cell_type_fine',
+            cell_type_confidence_column='cell_type_fine_confidence')\
+            .with_columns_obs(
+                passed_cell_type_fine=pl.col.cell_type_fine_confidence.ge(0.9))
+    print(sc.obs['passed_cell_type_fine'].value_counts())
+    print_df(sc.obs.group_by('cell_type_fine')
+        .agg(mean=pl.col('cell_type_fine_confidence').mean(),
+             count=pl.col('cell_type_fine_confidence').count())
+        .sort('mean'))    
     with Timer(f'[{study_name}] PaCMAP'):
-        sc = sc.embed(QC_column='passed_QC_fine', num_threads=24)
+        sc = sc.embed(num_threads=None)
     with Timer(f'[{study_name}] Plots'):
-        sc.plot_embedding('cell_type_fine', 
+        sc.plot_embedding(
+            'cell_type_fine', 
             f'{directory}/cell_type_fine_pacmap.png',
-            cells_to_plot_column='passed_QC_fine',
+            cells_to_plot_column='passed_cell_type_fine',
             label=True, label_kwargs={'size': 6},
             legend_kwargs={'fontsize': 'x-small', 'ncols': 1})
         confusion_matrix_plot(
             sc, original_labels_column, 'cell_type_fine', directory)
     return(sc)
 
+################################################################################
+
 rosmap_basic = pl.read_csv(
     'projects/def-wainberg/single-cell/Green/'
     'dataset_978_basic_04-21-2023.csv')\
     .unique(subset='projid')\
-    .drop(['study', 'scale_to'])
+    .drop('study', 'scaled_to')
 rosmap_long = pl.read_csv(
     'projects/def-wainberg/single-cell/Green/'
     'dataset_978_long_04-21-2023.csv',
     infer_schema_length=10000)\
     .sort('projid', 'fu_year', descending=[False, True])\
-    .unique(subset='projid')
+    .unique(subset='projid', keep='first')
 rosmap_all = rosmap_basic\
     .join(rosmap_long, on='projid', how='full', coalesce=True)\
     .pipe(lambda tdf: tdf.drop([
@@ -107,34 +114,39 @@ else:
         sc = SingleCell(
             f'{sc_dir}/p400_qced_shareable.h5ad', 
             num_threads=None)
-        sc_orig = sc.copy()
         rosmap_all_filt = rosmap_all\
             .cast({'projid': pl.Int32})\
-            .drop([col for col in sc.obs.columns if col != 'projid'])
+            .drop([col for col in sc.obs.columns if col != 'projid'],
+                  strict=False)
         sc = sc\
             .join_obs(rosmap_all_filt, on='projid')\
             .with_columns_obs(
                 projid=pl.col.projid.cast(pl.String),
-                cell_type_broad=pl.col.subset.replace(
-                    {'CUX2+': 'Excitatory'}))\
-            .qc(cell_type_confidence_column='cell.type.prob',
-                doublet_column='is.doublet.df',
-                custom_filter=pl.col.projid.is_not_null())
-        sc = cell_type_annotation(sc, 
-                study_name=study_name, 
-                original_labels_column='state', 
-                directory=sc_dir)
+                cell_type_broad=pl.col.subset.cast(pl.String)
+                    .replace({'CUX2+': 'Excitatory'}))\
+            .qc(custom_filter=pl.col('cell.type.prob').ge(0.9) & 
+                    pl.col.projid.is_not_null() &
+                    pl.col('is.doublet.df').not_(),
+                num_threads=None)
+        sc_orig = sc.copy()
+        sc = cell_type_annotation(
+            sc, 
+            study_name=study_name, 
+            original_labels_column='state', 
+            directory=sc_dir)
         sc.X = sc_orig.X
+        sc = sc.drop_uns('normalized')
         sc.save(sc_file, overwrite=True)
 
 for level in ['broad', 'fine']:
     with Timer(f'[{study_name}] Pseudobulking at the {level} level'):
-        QC_column = 'passed_QC_fine' if level == 'broad' else 'passed_QC'
+        QC_column = 'passed_cell_type_fine' if level == 'fine' else None 
         pb = sc\
             .pseudobulk(
                 ID_column='projid', 
                 cell_type_column=f'cell_type_{level}',
                 QC_column=QC_column,
+                sort_genes=True,
                 num_threads=None)\
             .filter_var(
                 pl.col._index.is_in(get_coding_genes()['gene']))\
