@@ -111,15 +111,11 @@ if os.path.exists(sc_file):
         sc = SingleCell(sc_file, num_threads=None)
 else:
     with Timer(f'[{study_name}] Preprocessing single cell'):
-        sc = SingleCell(
-            f'{sc_dir}/p400_qced_shareable.h5ad', 
-            num_threads=None)
-        rosmap_all_filt = rosmap_all\
-            .cast({'projid': pl.Int32})\
-            .drop([col for col in sc.obs.columns if col != 'projid'],
-                  strict=False)
+        sc = SingleCell(f'{sc_dir}/p400_qced_shareable.h5ad', num_threads=None)
+        drop_cols = set(rosmap_all.columns) & set(sc.obs.columns) - {'projid'}
         sc = sc\
-            .join_obs(rosmap_all_filt, on='projid')\
+            .drop_obs(drop_cols)\
+            .join_obs(rosmap_all.cast({'projid': pl.Int32}), on='projid')\
             .with_columns_obs(
                 projid=pl.col.projid.cast(pl.String),
                 cell_type_broad=pl.col.subset.cast(pl.String)
@@ -183,11 +179,13 @@ else:
             f'{sc_dir}/meta.tsv', 
             columns=['cellName', 'Dataset', 'Major_Cell_Type', 
                     'Cell_Type', 'Individual'], separator='\t')\
-            .with_columns(cell_type_broad=pl.col.Major_Cell_Type.replace({
-                'Exc': 'Excitatory', 'Inh': 'Inhibitory',
-                'Ast': 'Astrocytes', 'Oli': 'Oligodendrocytes',
-                'Mic': 'Microglia', 'Vas': 'Endothelial',
-                'OPCs': 'Opc'}))
+            .with_columns(
+                cell_type_broad=pl.col.Major_Cell_Type.replace({
+                    'Exc': 'Excitatory', 'Inh': 'Inhibitory',
+                    'Ast': 'Astrocytes', 'Oli': 'Oligodendrocytes',
+                    'Mic': 'Microglia', 'Vas': 'Endothelial',
+                    'Opc': 'OPCs'}))
+        assert basic_meta.shape[0] == 2327742
         id_map1 = pl.read_csv(
             f'{sc_dir}/MIT_ROSMAP_Multiomics_individual_metadata.csv',
             columns=['individualID', 'individualIdSource', 'subject'])\
@@ -200,29 +198,36 @@ else:
         subject_meta = pl.read_csv(
             f'{sc_dir}/individual_metadata_deidentified.tsv', 
             separator='\t', null_values='NA')
-        rosmap_all_filt = rosmap_all\
-            .cast({'projid': pl.String}) 
         full_meta = basic_meta\
             .join(subject_meta, 
-                left_on='Individual', right_on='subject', how='left',
-                coalesce=True)\
+                  left_on='Individual', right_on='subject', how='left',
+                  coalesce=True)\
             .join(id_map1, left_on='Individual', right_on='subject', how='left',
                   coalesce=True)\
-            .join(id_map2, on='individualID', how='left', coalesce=True)\
-            .join(rosmap_all_filt, on='projid', how='left', coalesce=True)
-        sc = SingleCell(f'{sc_dir}/PFC427_raw_data.h5ad', 
-                num_threads=os.cpu_count())\
-            .join_obs(full_meta, left_on='_index', right_on='cellName',
-                validate='1:1')\
-            .qc(cell_type_confidence_column=None, 
-                doublet_column=None,
-                custom_filter=pl.col.cell_type_broad.is_not_null(),
-                allow_float=True)
+            .join(id_map2, on='individualID', how='left', coalesce=True)
+        drop_cols = \
+            set(full_meta.columns) & set(rosmap_all.columns) - {'projid'}
+        full_meta = full_meta\
+            .drop(drop_cols)\
+            .join(rosmap_all.cast({'projid': pl.String}),
+                  on='projid', how='left', coalesce=True)
+        assert full_meta.shape[0] == 2327742 
+
+        sc = SingleCell(f'{sc_dir}/PFC427_raw_data.h5ad', num_threads=None)
+        sc = sc\
+            .join_obs(full_meta, 
+                      left_on='_index', right_on='cellName', validate='1:1')\
+            .qc(custom_filter=pl.col.cell_type_broad.is_not_null() &
+                    pl.col.projid.is_not_null(),
+                MALAT1_filter=False,
+                allow_float=True,
+                num_threads=None)
         sc_orig = sc.copy()
-        sc = cell_type_annotation(sc, 
-                study_name=study_name, 
-                original_labels_column='Cell_Type', 
-                directory=sc_dir)
+        sc = cell_type_annotation(
+            sc, 
+            study_name=study_name, 
+            original_labels_column='Cell_Type', 
+            directory=sc_dir)
         sc.X = sc_orig.X
         sc.save(sc_file, overwrite=True)
 
