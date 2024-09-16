@@ -1,57 +1,148 @@
-import sys, os, polars as pl
+import sys, os, pickle, polars as pl
 sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
 from single_cell import Pseudobulk, DE
-from utils import Timer, print_df
+from utils import Timer, print_df, debug
+
+Pseudobulk.num_threads = -1
+debug(third_party=True)
 
 data_dir = 'projects/def-wainberg/single-cell'
 working_dir = 'projects/def-wainberg/karbabi/pseudobulk-nmf' 
-os.makedirs(f'{working_dir}/output/DE', exist_ok=True)
-os.makedirs(f'{working_dir}/figures/DE/voom', exist_ok=True)
 
-study_names = ['Green']
+study_names = ['Green', 'Mathys', 'SEAAD']
 covariates = {
     'Green': ['age_death', 'sex', 'pmi', 'apoe4_dosage'],
     'Mathys': ['age_death', 'sex', 'pmi', 'apoe4_dosage'],
-    'SEAAD': ['Age at Death', 'Sex', 'PMI', 'apoe4_dosage']}
+    'SEAAD': ['Age at Death', 'Sex', 'PMI', 'apoe4_dosage']
+}
+dx_column = 'dx_cc'
 
 de_results = {}
-for type in ['cc', 'cont']:
-    dx_column = {
-        'Green': 'dx_cc' if type == 'cc' else 'dx_cont',
-        'Mathys': 'dx_cc' if type == 'cc' else 'dx_cont',
-        'SEAAD': 'dx_cc' if type == 'cc' else 'dx_cont'}
-    
-    for study in study_names:
-        for level in ['broad', 'fine']:
-            with Timer(f'[{study}] differential expression at {level} level'):
-                pb = Pseudobulk(f'{data_dir}/{study}/pseudobulk/{level}')
-                min_people = round(0.8 * min(
-                    max(pb.obs.items(), key=lambda x: x[1].height)[1]
-                    .filter(pl.col(dx_column[study]).is_not_null())
-                    [dx_column[study]]
-                    .value_counts()['count']))
-                drop_cell_types = [
-                    cell_type for cell_type, (_, obs, _) in pb.items()
-                    if obs.filter(pl.col(dx_column[study]).is_not_null())
-                    [dx_column[study]].value_counts()['count'].min() 
-                    < min_people]
-                pb = pb.drop_cell_types(drop_cell_types)
+for study in study_names:
+    for level in ['broad', 'fine']:
+        with Timer(f'[{study}] differential expression '
+                   f'at {level} level on {dx_column}'):
+            pb = Pseudobulk(f'{data_dir}/{study}/pseudobulk/{level}')\
+                .qc(case_control_column=dx_column,
+                    custom_filter=pl.col(dx_column).is_not_null(),
+                    verbose=False)
+            de = pb\
+                .DE(label_column=dx_column, 
+                    covariate_columns=covariates[study],
+                    case_control=True,
+                    verbose=False)
+            de_results[study, level] = de
 
-                de = pb.qc(case_control_column=\
-                        dx_column[study] if type == 'cc' else None, 
-                        custom_filter=pl.col(dx_column[study]).is_not_null(),
-                        verbose=False)\
-                    .DE(label_column=dx_column[study], 
-                        case_control=type == 'cc',
-                        covariate_columns=covariates[study],
-                        verbose=False)
-                de_results[type, study, level] = de
-                save_name = f'{study}_{level}_{dx_column[study]}'
-                de.plot_voom(f'{working_dir}/figures/DE/voom/{save_name}', 
-                            overwrite=True, PNG=True)
-                de.save(f'{working_dir}/output/DE/{save_name}', overwrite=True)
-                print(save_name)    
-                print_df(de.get_num_hits(threshold=0.1).sort('cell_type'))
+            save_name = f'{study}_{level}_{dx_column}'
+            os.makedirs(f'{working_dir}/output/DE/{save_name}', exist_ok=True)
+            os.makedirs(f'{working_dir}/figures/DE/voom/{save_name}', 
+                        exist_ok=True)
+            
+            de.save(f'{working_dir}/output/DE/{save_name}', overwrite=True)
+            for cell_type in pb.keys():
+                de.plot_voom(cell_type,
+                             f'{working_dir}/figures/DE/voom/{save_name}/'
+                             f'{cell_type.replace('/', '_')}.png')
+            
+            print(save_name)    
+            print_df(de.get_num_hits(threshold=0.1).sort('cell_type'))
+
+with open(f'{working_dir}/output/DE/de_results.pkl', 'wb') as f:
+    pickle.dump(de_results, f)
+with open(f'{working_dir}/output/DE/de_results.pkl', 'rb') as f:
+    de_results = pickle.load(f)
+
+
+
+
+
+
+
+
+
+
+def overlap(cell_type, fdr_threshold=0.05):
+    broad = set(de_results['Green', 'broad'].table\
+                .filter((pl.col('cell_type') == cell_type) & 
+                        (pl.col('FDR') < fdr_threshold))['gene'])
+    fine = set(de_results['Green', 'fine'].table\
+               .filter((pl.col('cell_type') == cell_type) & 
+                       (pl.col('FDR') < fdr_threshold))['gene'])
+    return len(broad & fine)
+
+cell_type = 'Endothelial'
+print(de_results['Green', 'fine'].get_num_hits(threshold=0.1).filter(
+    pl.col('cell_type') == cell_type))
+print(de_results['Green', 'broad'].get_num_hits(threshold=0.1).filter(
+    pl.col('cell_type') == cell_type))
+f'Overlapping genes in Astrocyte (FDR < 0.05): ' \
+    f'{overlap(cell_type, 0.1)}'
+
+
+'''
+[Green] differential expression at broad level on dx_cc...
+Green_broad_dx_cc
+ cell_type        num_hits 
+ Astrocyte        13       
+ Endothelial      659      
+ Excitatory       1485     
+ Inhibitory       606      
+ Microglia-PVM    21       
+ OPC              8        
+ Oligodendrocyte  273      
+
+Green_fine_dx_cc
+ cell_type        num_hits 
+ Astrocyte        5        
+ Chandelier       9        
+ Endothelial      859      
+ L2/3 IT          1508     
+ L4 IT            2        
+ L5 ET            104      
+ L5 IT            1465     
+ L5/6 NP          1        
+ L6 CT            10       
+ L6 IT            4        
+ L6b              15       
+ Lamp5            180      
+ Lamp5 Lhx6       10       
+ Microglia-PVM    199      
+ OPC              55       
+ Oligodendrocyte  340      
+ Pvalb            458      
+ Sst              2        
+ VLMC             459      
+ Vip              52       
+
+Mathys_broad_dx_cc
+ cell_type        num_hits 
+ Astrocyte        361      
+ Endothelial      831      
+ Inhibitory       4        
+ Microglia-PVM    8        
+ OPC              27       
+ Oligodendrocyte  2        
+
+Mathys_fine_dx_cc
+ cell_type        num_hits 
+ Astrocyte        236      
+ L4 IT            111      
+ L5 IT            419      
+ L5/6 NP          8        
+ L6 CT            261      
+ L6 IT            18       
+ L6 IT Car3       5        
+ L6b              252      
+ Lamp5            18       
+ Lamp5 Lhx6       14       
+ Microglia-PVM    25       
+ OPC              72       
+ Oligodendrocyte  69       
+ Pvalb            37       
+ Sst              14       
+ VLMC             96       
+ Vip              230      
+'''
 
 '''
 Green_broad_pmAD
@@ -63,16 +154,6 @@ Green_broad_pmAD
  Microglia         26       
  OPCs              7        
  Oligodendrocytes  243      
-
-Green_broad_dx_cont
- cell_type         num_hits 
- Astrocytes        697      
- Endothelial       108      
- Excitatory        874      
- Inhibitory        226      
- Microglia         18       
- OPCs              125      
- Oligodendrocytes  320  
 
 Green_fine_pmAD
  cell_type        num_hits 
@@ -97,6 +178,18 @@ Green_fine_pmAD
  VLMC             1        
  Vip              84 
 
+ 
+Green_broad_dx_cont
+ cell_type         num_hits 
+ Astrocytes        697      
+ Endothelial       108      
+ Excitatory        874      
+ Inhibitory        226      
+ Microglia         18       
+ OPCs              125      
+ Oligodendrocytes  320  
+
+
 Green_fine_dx_cont
  cell_type        num_hits 
  Astrocyte        723      
@@ -120,58 +213,3 @@ Green_fine_dx_cont
  VLMC             1        
  Vip              116  
 '''
-
-
-de_1 = DE(f'output/DE/Green_{resolution}_{dx_column['Green']}').table 
-de_2 = DE(f'output/DE/Mathys_{resolution}_{dx_column['Mathys']}').table
-
-de_1.join(de_2, on=['cell_type', 'gene'], how='inner')\
-    .with_columns(same_sign = pl.col.logFC.mul(pl.col.logFC_right) > 0)\
-    .group_by('cell_type')\
-    .agg(n_overlaps_same_dir = pl.col.gene.filter(
-        pl.col.FDR.lt(0.05) & pl.col.same_sign).n_unique(),
-        n_overlaps = pl.col.gene.filter(
-        pl.col.FDR.lt(0.05)).n_unique(),
-        ratio = pl.col.gene.filter(
-        pl.col.FDR.lt(0.05) & pl.col.same_sign).n_unique() /
-        pl.col.gene.filter(
-        pl.col.FDR.lt(0.05)).n_unique())\
-    .sort('cell_type')
-    
-print_df(de.get_num_hits(threshold=0.2).sort('cell_type'))
-
-'''
- cell_type         n_overlaps_same_dir  n_overlaps  ratio    
- Astrocytes        80                   145         0.551724 
- Endothelial       1                    1           1.0      
- Excitatory        301                  572         0.526224 
- Inhibitory        63                   131         0.480916 
- Microglia         3                    5           0.6      
- Oligodendrocytes  38                   74          0.513514 
-
-Green
-cell_type         num_hits 
- Astrocytes        238      
- Endothelial       1        
- Excitatory        704      
- Inhibitory        173      
- Microglia         8        
- OPCs              2        
- Oligodendrocytes  113    
-
-Mathys 
-cell_type         num_hits 
- Astrocytes        211      
- Endothelial       1        
- Excitatory        14       
- Inhibitory        2        
- Microglia         8        
- Oligodendrocytes  450      
- Opc               10  
- 
-Gabitto 
-cell_type   num_hits 
- Inhibitory  26        
- 
-'''
-
